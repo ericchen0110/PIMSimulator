@@ -40,15 +40,16 @@ using std::hex;
 
 namespace DRAMSim
 {
-Transaction::Transaction(TransactionType transType, uint64_t addr, BurstType* dat)
-    : transactionType(transType), address(addr), data(dat)
+Transaction::Transaction(TransactionType transType, uint64_t addr, BurstType* dat,
+                         RequestClass requestClass_)
+    : transactionType(transType), address(addr), data(dat), requestClass(requestClass_)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 }
 
 Transaction::Transaction(TransactionType transType, uint64_t addr, const std::string& str,
-                         BurstType* dat)
-    : transactionType(transType), address(addr), tag(str), data(dat)
+                         BurstType* dat, RequestClass requestClass_)
+    : transactionType(transType), address(addr), data(dat), tag(str), requestClass(requestClass_)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 }
@@ -58,7 +59,9 @@ Transaction::Transaction(const Transaction& t)
       address(t.address),
       data(NULL),
       timeAdded(t.timeAdded),
-      timeReturned(t.timeReturned)
+      timeReturned(t.timeReturned),
+      tag(t.tag),
+      requestClass(t.requestClass)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 #ifndef NO_STORAGE

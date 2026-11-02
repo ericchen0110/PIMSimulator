@@ -34,6 +34,7 @@
 #include <string>
 
 #include "Burst.h"
+#include "RequestClass.h"
 #include "SystemConfiguration.h"
 
 namespace DRAMSim
@@ -64,12 +65,15 @@ class BusPacket
     uint64_t physicalAddress;
     BurstType* data;
     std::string tag;
+    RequestClass requestClass;
 
     // Functions
     BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw, unsigned r,
-              unsigned b, BurstType* dat, ostream& simLog);
+              unsigned b, BurstType* dat, ostream& simLog,
+              RequestClass requestClass = RequestClass::OTHER);
     BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw, unsigned r,
-              unsigned b, BurstType* dat, ostream& simLog, std::string tg);
+              unsigned b, BurstType* dat, ostream& simLog, std::string tg,
+              RequestClass requestClass = RequestClass::OTHER);
 
     void print();
     void print(uint64_t currentClockCycle, bool dataStart);

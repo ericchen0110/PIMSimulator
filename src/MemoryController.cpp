@@ -166,13 +166,26 @@ void MemoryController::setBankStates(size_t rank, size_t bank, CurrentBankState 
     bankStates[rank][bank].nextActivate = nextActivate;
 }
 
+MemoryControllerSnapshot MemoryController::getStatsSnapshot() const
+{
+    MemoryControllerSnapshot snapshot;
+    snapshot.cycles = currentClockCycle;
+    snapshot.reads = totalReads;
+    snapshot.writes = totalWrites;
+    snapshot.readsPerBank = totalReadsPerBank;
+    snapshot.writesPerBank = totalWritesPerBank;
+    snapshot.activatesPerBank = totalActivatesPerBank;
+    return snapshot;
+}
+
 void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
 {
     if (poppedBusPacket->busPacketType == WRITE)
     {
         writeDataToSend.push_back(new BusPacket(
             DATA, poppedBusPacket->physicalAddress, poppedBusPacket->column, poppedBusPacket->row,
-            poppedBusPacket->rank, poppedBusPacket->bank, poppedBusPacket->data, dramsimLog));
+            poppedBusPacket->rank, poppedBusPacket->bank, poppedBusPacket->data, dramsimLog,
+            poppedBusPacket->requestClass));
         writeDataCountdown.push_back(config.WL);
     }
 
@@ -210,6 +223,7 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
                 }
             }
             totalReads++;
+            totalReadsPerBank[SEQUENTIAL(rank, bank)]++;
 
             break;
 
@@ -240,10 +254,12 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
                 }
             }
             totalWrites++;
+            totalWritesPerBank[SEQUENTIAL(rank, bank)]++;
 
             break;
 
         case ACTIVATE:
+            totalActivatesPerBank[SEQUENTIAL(rank, bank)]++;
             setBankStates(rank, bank, RowActive, ACTIVATE, 0,
                           max(currentClockCycle + config.tRC, bankStates[rank][bank].nextActivate));
             bankStates[rank][bank].openRowAddress = poppedBusPacket->row;
@@ -346,7 +362,7 @@ void MemoryController::updateTransactionQueue()
             BusPacketType bpType = transaction->getBusPacketType();
             command = new BusPacket(bpType, transaction->address, newTransactionColumn,
                                     newTransactionRow, newTransactionRank, newTransactionBank,
-                                    transaction->data, dramsimLog);
+                                    transaction->data, dramsimLog, transaction->requestClass);
             command->tag = transaction->tag;
             commandQueue.enqueue(command);
 

@@ -51,6 +51,17 @@ namespace DRAMSim
 class Rank;
 class MemorySystem;
 class MemoryControllerStats;
+
+struct MemoryControllerSnapshot
+{
+    uint64_t cycles;
+    uint64_t reads;
+    uint64_t writes;
+    std::vector<uint64_t> readsPerBank;
+    std::vector<uint64_t> writesPerBank;
+    std::vector<uint64_t> activatesPerBank;
+};
+
 class MemoryController : public SimulatorObject
 {
   public:
@@ -68,6 +79,7 @@ class MemoryController : public SimulatorObject
     void resetStats();
     bool WillAcceptTransaction();
     bool addBarrier();
+    MemoryControllerSnapshot getStatsSnapshot() const;
 
     // fields
     vector<Transaction*> transactionQueue;

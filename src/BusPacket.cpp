@@ -34,19 +34,8 @@ using namespace DRAMSim;
 using namespace std;
 
 BusPacket::BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw,
-                     unsigned r, unsigned b, BurstType* dat, ostream& simLog)
-    : dramsimLog(simLog),
-      busPacketType(packtype),
-      column(col),
-      row(rw),
-      bank(b),
-      rank(r),
-      physicalAddress(physicalAddr),
-      data(dat)
-{
-}
-BusPacket::BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw,
-                     unsigned r, unsigned b, BurstType* dat, ostream& simLog, std::string tg)
+                     unsigned r, unsigned b, BurstType* dat, ostream& simLog,
+                     RequestClass requestClass_)
     : dramsimLog(simLog),
       busPacketType(packtype),
       column(col),
@@ -55,7 +44,22 @@ BusPacket::BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col
       rank(r),
       physicalAddress(physicalAddr),
       data(dat),
-      tag(tg)
+      requestClass(requestClass_)
+{
+}
+BusPacket::BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw,
+                     unsigned r, unsigned b, BurstType* dat, ostream& simLog, std::string tg,
+                     RequestClass requestClass_)
+    : dramsimLog(simLog),
+      busPacketType(packtype),
+      column(col),
+      row(rw),
+      bank(b),
+      rank(r),
+      physicalAddress(physicalAddr),
+      data(dat),
+      tag(tg),
+      requestClass(requestClass_)
 {
 }
 

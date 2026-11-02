@@ -46,6 +46,12 @@
 
 namespace DRAMSim
 {
+struct MemoryStatsSnapshot
+{
+    uint64_t cycles;
+    std::vector<MemoryControllerSnapshot> channels;
+};
+
 class MultiChannelMemorySystem : public MemoryObject
 {
   public:
@@ -78,6 +84,7 @@ class MultiChannelMemorySystem : public MemoryObject
 
     bool willAcceptTransaction(uint64_t addr);
     bool willAcceptTransaction();
+    MemoryStatsSnapshot getStatsSnapshot() const;
 
     // output file
     std::ofstream visDataOut;

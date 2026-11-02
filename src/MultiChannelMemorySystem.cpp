@@ -353,16 +353,18 @@ void MultiChannelMemorySystem::mkdirIfNotExist(string path)
 MultiChannelMemorySystem::~MultiChannelMemorySystem()
 {
     // delete clockDomainCrosser;
-    delete csvOut;
-    delete[] numFence;
-    delete addrMapping;
-    delete configuration;
-
+    // Channels hold references to both the configuration and CSV writer, so destroy them before
+    // releasing the shared objects they use.
     for (size_t i = 0; i < configuration->NUM_CHANS; i++)
     {
         delete channels[i];
     }
     channels.clear();
+
+    delete configuration;
+    delete addrMapping;
+    delete[] numFence;
+    delete csvOut;
 
     // flush our streams and close them up
     if (LOG_OUTPUT)
@@ -603,4 +605,14 @@ bool MultiChannelMemorySystem::willAcceptTransaction()
         }
     }
     return true;
+}
+
+MemoryStatsSnapshot MultiChannelMemorySystem::getStatsSnapshot() const
+{
+    MemoryStatsSnapshot snapshot;
+    snapshot.cycles = currentClockCycle;
+    snapshot.channels.reserve(channels.size());
+    for (const MemorySystem* channel : channels)
+        snapshot.channels.push_back(channel->memoryController->getStatsSnapshot());
+    return snapshot;
 }

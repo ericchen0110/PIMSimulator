@@ -264,7 +264,8 @@ bool CommandQueue::process_command(BusPacket** busPacket)
             {
                 *busPacket =
                     new BusPacket(ACTIVATE, packet->physicalAddress, packet->column, packet->row,
-                                  packet->rank, packet->bank, nullptr, dramsimLog, packet->tag);
+                                  packet->rank, packet->bank, nullptr, dramsimLog, packet->tag,
+                                  packet->requestClass);
                 if (isIssuable(*busPacket))
                 {
                     return true;

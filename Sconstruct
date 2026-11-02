@@ -39,6 +39,16 @@ def build(target_name, base_path, build_flags):
     # setup the default build envronments
     env = Environment()
 
+    # Homebrew installs GoogleTest outside the default compiler search paths.
+    # Keep the existing Linux behavior while making Apple Silicon/macOS builds
+    # work without requiring global include or library path changes.
+    homebrew_gtest = '/opt/homebrew/opt/googletest'
+    dependency_include_paths = [base_path["lib"], base_path["source"], base_path["tools"]]
+    dependency_library_paths = ['.']
+    if os.path.isdir(homebrew_gtest):
+        dependency_include_paths.append(joinpath(homebrew_gtest, 'include'))
+        dependency_library_paths.append(joinpath(homebrew_gtest, 'lib'))
+
     env.Append(CXXFLAGS=build_flags["CXXFLAGS"] + build_flags["gprof_option"])
     env.Append(LINKFLAGS=build_flags["LINKFLAGS"] + build_flags["gprof_option"])
 
@@ -50,8 +60,8 @@ def build(target_name, base_path, build_flags):
     build_sources = getSources("build")
     env.Program(target=target_name["binary"],
                 source=build_sources,
-                CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                LIBPATH=['.'], LIBS=['gtest', 'pthread'])
+                CPPPATH=dependency_include_paths,
+                LIBPATH=dependency_library_paths, LIBS=['gtest', 'pthread'])
 
     no_lib = ARGUMENTS.get('NO_LIBRARY', 0)
     if int(no_lib) == 0:
@@ -59,14 +69,14 @@ def build(target_name, base_path, build_flags):
         # print ("Creating a static library from objects")
         env.StaticLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=dependency_include_paths,
+                          LIBPATH=dependency_library_paths,
                           LIBS=['gtest', 'pthread'])
         # print ("Creating a shared library from objects")
         env.SharedLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=dependency_include_paths,
+                          LIBPATH=dependency_library_paths,
                           LIBS=['gtest', 'pthread'])
 
 
@@ -88,8 +98,8 @@ base_path = {
 
 build_flags = {
     "gprof_option": '',
-    "CXXFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
-    "LINKFLAGS": '-g -O2 -std=c++14 -Wall -Wno-reorder -Wno-sign-compare',
+    "CXXFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
+    "LINKFLAGS": '-g -O2 -std=c++17 -Wall -Wno-reorder -Wno-sign-compare',
 }
 
 setNumJobs()

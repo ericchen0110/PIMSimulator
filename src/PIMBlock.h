@@ -39,7 +39,9 @@ class PIMBlock
     BurstType grfB[8];
     BurstType mOut;
     BurstType aOut;
+    BurstType idx;  // per-lane indices into grfA, loaded by LDIDX
 
+    void gather(BurstType& dstBst) const;
     void add(BurstType& dstBst, BurstType& src0Bst, BurstType& src1Bst);
     void mac(BurstType& dstBst, BurstType& src0Bst, BurstType& src1Bst);
     void mul(BurstType& dstBst, BurstType& src0Bst, BurstType& src1Bst);

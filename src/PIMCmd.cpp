@@ -64,6 +64,9 @@ void PIMCmd::fromInt(uint32_t val)
             src0Idx_ = fromBit(val, 4, 4);
             src1Idx_ = fromBit(val, 4, 0);
             break;
+        case PIMCmdType::LDIDX:
+            src0_ = PIMOpdType(fromBit(val, 3, 22));
+            break;
 
         default:
             break;
@@ -72,6 +75,19 @@ void PIMCmd::fromInt(uint32_t val)
 
 void PIMCmd::validationCheck() const
 {
+    bool src0_is_bank = (src0_ == PIMOpdType::EVEN_BANK || src0_ == PIMOpdType::ODD_BANK);
+    if (type_ == PIMCmdType::LDIDX && !src0_is_bank)
+    {
+        std::cerr << "ERROR) LDIDX source must be a bank: " << toStr() << std::endl;
+        exit(-1);
+    }
+    if (type_ == PIMCmdType::SPMAC &&
+        (!src0_is_bank || src1_ != PIMOpdType::GRF_A || dst_ != PIMOpdType::GRF_B || isAuto_))
+    {
+        std::cerr << "ERROR) SPMAC must be GRF_B, bank, GRF_A, non-auto: " << toStr() << std::endl;
+        exit(-1);
+    }
+    
     if (type_ == PIMCmdType::MOV || type_ == PIMCmdType::FILL)
     {
         if (dst_ == PIMOpdType::EVEN_BANK || dst_ == PIMOpdType::ODD_BANK)
@@ -138,6 +154,9 @@ uint32_t PIMCmd::toInt() const
             val |= toBit(src0Idx_, 4, 4);
             val |= toBit(src1Idx_, 4, 0);
             break;
+        case PIMCmdType::LDIDX:
+            val |= toBit(int(src0_), 3, 22);
+            break;
 
         default:
             break;
@@ -185,6 +204,9 @@ std::string PIMCmd::toStr() const
             ss << opdToStr(src0_, src0Idx_) << ", ";
             ss << opdToStr(src1_, src1Idx_) << ", ";
             ss << opdToStr(src2_, src1Idx_);
+            break;
+        case PIMCmdType::LDIDX:
+            ss << opdToStr(src0_, src0Idx_);
             break;
 
         default:

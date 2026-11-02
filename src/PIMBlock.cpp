@@ -106,6 +106,21 @@ void PIMBlock::mad(BurstType& dstBst, BurstType& src0Bst, BurstType& src1Bst, Bu
         dstBst = src0Bst * src1Bst + src2Bst;
 }
 
+void PIMBlock::gather(BurstType& dstBst) const
+{
+    if (pimPrecision_ != FP16)
+    {
+        ERROR("== Error - SPMAC gather only supports FP16");
+        exit(-1);
+    }
+
+    for (int lane = 0; lane < 16; lane++)
+    {
+        unsigned j = idx.u16Data_[lane] & 0x7f;  // 8 registers * 16 lanes = 128 entries
+        dstBst.fp16Data_[lane] = grfA[j >> 4].fp16Data_[j & 0xf];
+    }
+}
+
 std::string PIMBlock::print()
 {
     stringstream ss;
@@ -114,6 +129,7 @@ std::string PIMBlock::print()
     for (int i = 0; i < 8; i++) ss << "[GRF_B][" << i << "]" << grfB[i].fp16ToStr() << endl;
     ss << "[M_OUT]" << mOut.binToStr() << endl;
     ss << "[A_OUT]" << aOut.binToStr() << endl;
+    ss << "[IDX]" << idx.hexToStr() << endl;
 
     return ss.str();
 }

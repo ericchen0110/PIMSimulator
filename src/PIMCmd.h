@@ -17,6 +17,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <cstdint>
 
 using namespace std;
 
@@ -29,12 +30,12 @@ enum class PIMCmdType
     MUL,
     MAC,
     MAD,
-    REV0,
+    SPMAC,
     REV1,
     REV2,
     MOV,
     FILL,
-    REV3,
+    LDIDX,
     REV4,
     REV5,
     REV6,
@@ -227,6 +228,10 @@ class PIMCmd
                 return "MAC";
             case PIMCmdType::MAD:
                 return "MAD";
+            case PIMCmdType::SPMAC:
+                return "SPMAC";
+            case PIMCmdType::LDIDX:
+                return "LDIDX";
             default:
                 return "NOT_DEFINED";
         }

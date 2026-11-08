@@ -54,6 +54,15 @@ class MemoryControllerStats;
 class MemoryController : public SimulatorObject
 {
   public:
+    struct SparseSchedulerStats
+    {
+        uint64_t sparseTransactions = 0;
+        uint64_t reorderedTransactions = 0;
+        uint64_t rowHitAdmissions = 0;
+        uint64_t starvationPromotions = 0;
+        uint64_t totalQueueWait = 0;
+    };
+
     // functions
     MemoryController(MemorySystem* ms, CSVWriter& csvOut_, ostream& simLog, Configuration& config);
     virtual ~MemoryController();
@@ -68,6 +77,11 @@ class MemoryController : public SimulatorObject
     void resetStats();
     bool WillAcceptTransaction();
     bool addBarrier();
+    void setSparseSchedulingEnabled(bool enabled);
+    bool isSparseSchedulingEnabled() const;
+    const SparseSchedulerStats& getSparseSchedulerStats() const;
+    uint64_t getTotalActivates() const;
+    uint64_t getTotalPrecharges() const;
 
     // fields
     vector<Transaction*> transactionQueue;
@@ -114,6 +128,12 @@ class MemoryController : public SimulatorObject
     vector<unsigned> refreshCountdown, refreshCountdownBank;
     Configuration& config;
     MemoryControllerStats* memoryContStats;
+    bool sparseSchedulingEnabled;
+    SparseSchedulerStats sparseSchedulerStats;
+    map<uint64_t, unsigned> sparseDependencyProgress;
+    uint64_t lastSparseDependencyId;
+    uint64_t totalActivateCommands;
+    uint64_t totalPrechargeCommands;
 
   public:
     // energy values are per rank -- SST uses these directly, so make these public

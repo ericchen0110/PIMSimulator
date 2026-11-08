@@ -456,6 +456,14 @@ bool MultiChannelMemorySystem::addBarrier(int chanId)
     return channels[chanId]->addBarrier();
 }
 
+void MultiChannelMemorySystem::setSparseSchedulingEnabled(bool enabled)
+{
+    for (auto* channel : channels)
+    {
+        channel->memoryController->setSparseSchedulingEnabled(enabled);
+    }
+}
+
 bool MultiChannelMemorySystem::addTransaction(bool isWrite, uint64_t addr, BurstType* data)
 {
     unsigned channelNumber = findChannelNumber(addr);

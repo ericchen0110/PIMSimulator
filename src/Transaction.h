@@ -47,6 +47,18 @@ enum TransactionType
     RETURN_DATA
 };
 
+// Optional semantic information used by sparse-aware memory scheduling.  Normal
+// callers leave this as NON_SPARSE and retain the original FIFO behaviour.
+enum SparseRequestType
+{
+    NON_SPARSE,
+    SPARSE_METADATA,
+    SPARSE_INDEX,
+    SPARSE_VALUE,
+    SPARSE_VECTOR,
+    SPARSE_OUTPUT
+};
+
 class Transaction
 {
     Transaction();
@@ -59,12 +71,20 @@ class Transaction
     uint64_t timeAdded;
     uint64_t timeReturned;
     std::string tag;
+    SparseRequestType sparseRequestType;
+    uint64_t sparseDependencyId;
 
     friend ostream& operator<<(ostream& os, const Transaction& t);
     // functions
     Transaction(TransactionType transType, uint64_t addr, BurstType* dat);
     Transaction(TransactionType transType, uint64_t addr, const std::string& str, BurstType* dat);
     Transaction(const Transaction& t);
+
+    void setSparseMetadata(SparseRequestType requestType, uint64_t dependencyId)
+    {
+        sparseRequestType = requestType;
+        sparseDependencyId = dependencyId;
+    }
 
     BusPacketType getBusPacketType()
     {

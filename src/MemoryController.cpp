@@ -31,6 +31,7 @@
 #include "MemoryController.h"
 
 #include <iostream>
+#include <limits>
 
 #include "AddressMapping.h"
 #include "MemorySystem.h"
@@ -56,6 +57,10 @@ MemoryController::MemoryController(MemorySystem* parent, CSVWriter& csvOut_, ost
       totalRefreshes(0),
       refreshRank(0),
       refreshBank(0),
+      sparseSchedulingEnabled(false),
+      lastSparseDependencyId(0),
+      totalActivateCommands(0),
+      totalPrechargeCommands(0),
       totalReads(0),
       totalWrites(0)
 {
@@ -244,6 +249,7 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
             break;
 
         case ACTIVATE:
+            totalActivateCommands++;
             setBankStates(rank, bank, RowActive, ACTIVATE, 0,
                           max(currentClockCycle + config.tRC, bankStates[rank][bank].nextActivate));
             bankStates[rank][bank].openRowAddress = poppedBusPacket->row;
@@ -268,6 +274,7 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
             break;
 
         case PRECHARGE:
+            totalPrechargeCommands++;
             setBankStates(rank, bank, Precharging, PRECHARGE, config.tRP,
                           max(currentClockCycle + config.tRP, bankStates[rank][bank].nextActivate));
 
@@ -305,10 +312,13 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
 void MemoryController::updateTransactionQueue()
 {
     auto am = config.addrMapping;
+    size_t selectedIndex = transactionQueue.size();
+    int64_t selectedScore = std::numeric_limits<int64_t>::min();
+    bool selectedRowHit = false;
+    uint64_t selectedAge = 0;
+
     for (size_t i = 0; i < transactionQueue.size(); i++)
     {
-        // pop off top transaction from queue assuming simple scheduling at the moment
-        // will eventually add policies here
         Transaction* transaction = transactionQueue[i];
 
         // map address to rank,bank,row,col
@@ -321,57 +331,168 @@ void MemoryController::updateTransactionQueue()
 
         // if we have room, break up the transaction into the appropriate commands
         // and add them to the command queue
-        if (commandQueue.hasRoomFor(1, newTransactionRank, newTransactionBank))
+        if (!commandQueue.hasRoomFor(1, newTransactionRank, newTransactionBank))
+            continue;
+
+        if (!sparseSchedulingEnabled)
         {
-            if (DEBUG_ADDR_MAP)
-            {
-                PRINTN("== New Transaction - Mapping Address [0x" << hex << transaction->address
-                                                                  << dec << "]");
-                if (transaction->transactionType == DATA_READ)
-                    PRINT(" (Read)");
-                else
-                    PRINT(" (Write)");
-                PRINT("  Rank : " << newTransactionRank);
-                PRINT("  Bank : " << newTransactionBank);
-                PRINT("  Row  : " << newTransactionRow);
-                PRINT("  Col  : " << newTransactionColumn);
-            }
-
-            // now that we know there is room in the command queue, we can remove from
-            // the transaction queue
-            transactionQueue.erase(transactionQueue.begin() + i);
-            BusPacket* command;
-
-            // create read or write command and enqueue it
-            BusPacketType bpType = transaction->getBusPacketType();
-            command = new BusPacket(bpType, transaction->address, newTransactionColumn,
-                                    newTransactionRow, newTransactionRank, newTransactionBank,
-                                    transaction->data, dramsimLog);
-            command->tag = transaction->tag;
-            commandQueue.enqueue(command);
-
-            // If we have a read, save the transaction so when the data comes back
-            // in a bus packet, we can staple it back into a transaction and return it
-            if (transaction->transactionType == DATA_READ)
-                pendingReadTransactions.push_back(transaction);
-            else
-                // just delete the transaction now that it's a buspacket
-                delete transaction;
-            /* only allow one transaction to be scheduled per cycle -- this
-             * should
-             * be a reasonable assumption considering how much logic would be
-             * required to schedule multiple entries per cycle (parallel data
-             * lines, switching logic, decision logic)
-             */
+            selectedIndex = i;
+            selectedRowHit = bankStates[newTransactionRank][newTransactionBank].currentBankState ==
+                                 RowActive &&
+                             bankStates[newTransactionRank][newTransactionBank].openRowAddress ==
+                                 newTransactionRow;
             break;
         }
-        /*
-        else // no room, do nothing this cycle
+
+        const uint64_t age = currentClockCycle - transaction->timeAdded;
+        const bool rowHit =
+            transaction->sparseRequestType != NON_SPARSE &&
+            bankStates[newTransactionRank][newTransactionBank].currentBankState == RowActive &&
+            bankStates[newTransactionRank][newTransactionBank].openRowAddress == newTransactionRow &&
+            !commandQueue.hasRowConflict(newTransactionRank, newTransactionBank,
+                                         newTransactionRow);
+        int64_t score = static_cast<int64_t>(std::min<uint64_t>(age, 4095));
+        if (rowHit)
+            score += 20000;
+
+        if (transaction->sparseRequestType != NON_SPARSE)
         {
-            // PRINT( "== Warning - No room in command queue" << endl;
+            static const int classPriority[] = {0, 7000, 6500, 5000, 3500, 2000};
+            score += classPriority[transaction->sparseRequestType];
+
+            const auto progress = sparseDependencyProgress.find(transaction->sparseDependencyId);
+            const unsigned completedStage =
+                progress == sparseDependencyProgress.end() ? 0 : progress->second;
+            const unsigned requiredPreviousStage =
+                transaction->sparseRequestType == SPARSE_VALUE
+                    ? 2
+                    : (transaction->sparseRequestType == SPARSE_VECTOR ? 3 : 0);
+            if (requiredPreviousStage != 0 && completedStage >= requiredPreviousStage)
+                score += 2500;
+            if (transaction->sparseDependencyId == lastSparseDependencyId)
+                score += 750;
         }
-        */
+
+        // Bound latency even when a stream continually produces row hits.
+        if (age >= 1024)
+            score += 1000000 + static_cast<int64_t>(age);
+
+        const bool starved = age >= 1024;
+        const bool selectedStarved = selectedAge >= 1024;
+        const bool shouldSelect =
+            selectedIndex == transactionQueue.size() ||
+            (starved && (!selectedStarved || age > selectedAge)) ||
+            (!selectedStarved && rowHit && !selectedRowHit) ||
+            (!selectedStarved && rowHit == selectedRowHit && rowHit && score > selectedScore);
+        if (shouldSelect)
+        {
+            selectedIndex = i;
+            selectedScore = score;
+            selectedRowHit = rowHit;
+            selectedAge = age;
+        }
     }
+
+    if (selectedIndex != transactionQueue.size())
+    {
+        Transaction* transaction = transactionQueue[selectedIndex];
+        unsigned newTransactionChan, newTransactionRank, newTransactionBank, newTransactionRow,
+            newTransactionColumn;
+        am.addressMapping(transaction->address, newTransactionChan, newTransactionRank,
+                          newTransactionBank, newTransactionRow, newTransactionColumn);
+
+        if (DEBUG_ADDR_MAP)
+        {
+            PRINTN("== New Transaction - Mapping Address [0x" << hex << transaction->address << dec
+                                                              << "]");
+            if (transaction->transactionType == DATA_READ)
+                PRINT(" (Read)");
+            else
+                PRINT(" (Write)");
+            PRINT("  Rank : " << newTransactionRank);
+            PRINT("  Bank : " << newTransactionBank);
+            PRINT("  Row  : " << newTransactionRow);
+            PRINT("  Col  : " << newTransactionColumn);
+        }
+
+        // now that we know there is room in the command queue, we can remove from
+        // the transaction queue
+        transactionQueue.erase(transactionQueue.begin() + selectedIndex);
+        BusPacket* command;
+
+        // create read or write command and enqueue it
+        BusPacketType bpType = transaction->getBusPacketType();
+        command = new BusPacket(bpType, transaction->address, newTransactionColumn,
+                                newTransactionRow, newTransactionRank, newTransactionBank,
+                                transaction->data, dramsimLog);
+        command->tag = transaction->tag;
+        commandQueue.enqueue(command);
+
+        if (sparseSchedulingEnabled)
+        {
+            const uint64_t age = currentClockCycle - transaction->timeAdded;
+            if (transaction->sparseRequestType != NON_SPARSE)
+            {
+                sparseSchedulerStats.sparseTransactions++;
+                sparseSchedulerStats.totalQueueWait += age;
+                sparseSchedulerStats.reorderedTransactions += selectedIndex != 0;
+                sparseSchedulerStats.rowHitAdmissions += selectedRowHit;
+                sparseSchedulerStats.starvationPromotions += age >= 1024;
+                unsigned stage = 0;
+                if (transaction->sparseRequestType == SPARSE_METADATA)
+                    stage = 1;
+                else if (transaction->sparseRequestType == SPARSE_INDEX)
+                    stage = 2;
+                else if (transaction->sparseRequestType == SPARSE_VALUE)
+                    stage = 3;
+                else if (transaction->sparseRequestType == SPARSE_VECTOR)
+                    stage = 4;
+                sparseDependencyProgress[transaction->sparseDependencyId] =
+                    max(sparseDependencyProgress[transaction->sparseDependencyId], stage);
+                lastSparseDependencyId = transaction->sparseDependencyId;
+            }
+        }
+
+        // If we have a read, save the transaction so when the data comes back
+        // in a bus packet, we can staple it back into a transaction and return it
+        if (transaction->transactionType == DATA_READ)
+            pendingReadTransactions.push_back(transaction);
+        else
+            // just delete the transaction now that it's a buspacket
+            delete transaction;
+        // Only one transaction is admitted per cycle.
+    }
+}
+
+void MemoryController::setSparseSchedulingEnabled(bool enabled)
+{
+    if (enabled && !sparseSchedulingEnabled)
+    {
+        sparseSchedulerStats = SparseSchedulerStats();
+        sparseDependencyProgress.clear();
+        lastSparseDependencyId = 0;
+    }
+    sparseSchedulingEnabled = enabled;
+}
+
+bool MemoryController::isSparseSchedulingEnabled() const
+{
+    return sparseSchedulingEnabled;
+}
+
+const MemoryController::SparseSchedulerStats& MemoryController::getSparseSchedulerStats() const
+{
+    return sparseSchedulerStats;
+}
+
+uint64_t MemoryController::getTotalActivates() const
+{
+    return totalActivateCommands;
+}
+
+uint64_t MemoryController::getTotalPrecharges() const
+{
+    return totalPrechargeCommands;
 }
 
 void MemoryController::printDebugOnUpate()

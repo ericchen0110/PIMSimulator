@@ -59,6 +59,7 @@ class MultiChannelMemorySystem : public MemoryObject
                                 BurstType* data);
 
     bool addBarrier(int chanId);
+    void setSparseSchedulingEnabled(bool enabled);
 
     void update();
     void printStats(bool finalStats = false);

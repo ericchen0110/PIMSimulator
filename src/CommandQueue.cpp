@@ -166,6 +166,17 @@ void CommandQueue::enqueue(BusPacket* newBusPacket)
     }
 }
 
+bool CommandQueue::hasRowConflict(unsigned rank, unsigned bank, unsigned row)
+{
+    vector<BusPacket*>& queue = getCommandQueue(rank, bank);
+    for (const BusPacket* packet : queue)
+    {
+        if (packet->bank == bank && packet->row != row)
+            return true;
+    }
+    return false;
+}
+
 bool CommandQueue::process_refresh(BusPacket** busPacket)
 {
     if (refreshWaiting)

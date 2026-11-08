@@ -46,11 +46,18 @@ struct BenchmarkSpec
     std::string system_config;
     uint32_t block_size;
     uint32_t seed;
+    bool sparse_scheduler = true;
+};
+
+struct PackedStream
+{
+    uint64_t bytes;
+    SparseRequestType request_type;
 };
 
 struct TrafficPlan
 {
-    std::vector<uint64_t> packed_stream_bytes;
+    std::vector<PackedStream> packed_streams;
     std::vector<uint32_t> input_columns;
     uint64_t stored_entries = 0;
 };
@@ -66,6 +73,13 @@ struct BenchmarkResult
     double channel_imbalance = 0.0;
     uint64_t energy = 0;
     uint64_t stored_entries = 0;
+    uint64_t sparse_scheduled = 0;
+    uint64_t reordered = 0;
+    uint64_t row_hit_admissions = 0;
+    uint64_t starvation_promotions = 0;
+    uint64_t queue_wait = 0;
+    uint64_t activates = 0;
+    uint64_t precharges = 0;
 };
 
 uint64_t hash64(uint64_t value)
@@ -99,7 +113,8 @@ BenchmarkSpec specFromEnvironment()
             envString("SPMV_FORMAT", "csr"),
             envString("SPMV_SYSTEM_CONFIG", "system_hbm.ini"),
             envUnsigned("SPMV_BLOCK_SIZE", 4),
-            envUnsigned("SPMV_SEED", 570)};
+            envUnsigned("SPMV_SEED", 570),
+            envString("SPMV_SCHEDULER", "sparse") != "baseline"};
 }
 
 uint32_t entriesInRow(const BenchmarkSpec& spec, uint32_t row)
@@ -220,15 +235,17 @@ TrafficPlan makeTrafficPlan(const CsrMatrix& matrix, const BenchmarkSpec& spec)
 
     if (spec.format == "csr")
     {
-        plan.packed_stream_bytes = {(matrix.rows + 1ULL) * sizeof(uint32_t),
-                                    nnz * sizeof(uint32_t), nnz * sizeof(float)};
+        plan.packed_streams = {{(matrix.rows + 1ULL) * sizeof(uint32_t), SPARSE_METADATA},
+                               {nnz * sizeof(uint32_t), SPARSE_INDEX},
+                               {nnz * sizeof(float), SPARSE_VALUE}};
         plan.input_columns = matrix.col_idx;
         plan.stored_entries = nnz;
     }
     else if (spec.format == "coo")
     {
-        plan.packed_stream_bytes = {nnz * sizeof(uint32_t), nnz * sizeof(uint32_t),
-                                    nnz * sizeof(float)};
+        plan.packed_streams = {{nnz * sizeof(uint32_t), SPARSE_METADATA},
+                               {nnz * sizeof(uint32_t), SPARSE_INDEX},
+                               {nnz * sizeof(float), SPARSE_VALUE}};
         plan.input_columns = matrix.col_idx;
         plan.stored_entries = nnz;
     }
@@ -241,8 +258,8 @@ TrafficPlan makeTrafficPlan(const CsrMatrix& matrix, const BenchmarkSpec& spec)
                 max_row_entries, matrix.row_ptr[row + 1] - matrix.row_ptr[row]);
         }
         plan.stored_entries = matrix.rows * max_row_entries;
-        plan.packed_stream_bytes = {plan.stored_entries * sizeof(uint32_t),
-                                    plan.stored_entries * sizeof(float)};
+        plan.packed_streams = {{plan.stored_entries * sizeof(uint32_t), SPARSE_INDEX},
+                               {plan.stored_entries * sizeof(float), SPARSE_VALUE}};
         for (uint32_t row = 0; row < matrix.rows; ++row)
         {
             const uint32_t begin = matrix.row_ptr[row];
@@ -283,9 +300,9 @@ TrafficPlan makeTrafficPlan(const CsrMatrix& matrix, const BenchmarkSpec& spec)
             }
         }
         plan.stored_entries = blocks * block * block;
-        plan.packed_stream_bytes = {(block_rows + 1ULL) * sizeof(uint32_t),
-                                    blocks * sizeof(uint32_t),
-                                    plan.stored_entries * sizeof(float)};
+        plan.packed_streams = {{(block_rows + 1ULL) * sizeof(uint32_t), SPARSE_METADATA},
+                               {blocks * sizeof(uint32_t), SPARSE_INDEX},
+                               {plan.stored_entries * sizeof(float), SPARSE_VALUE}};
     }
     else
     {
@@ -301,11 +318,15 @@ uint64_t alignUp(uint64_t address, uint64_t alignment)
 
 void addPackedTraffic(const std::shared_ptr<MultiChannelMemorySystem>& memory, bool is_write,
                       uint64_t base_address, uint64_t size_in_bytes, uint64_t burst_bytes,
-                      BurstType* data)
+                      BurstType* data, SparseRequestType request_type,
+                      uint64_t dependency_base = 0)
 {
     for (uint64_t offset = 0; offset < size_in_bytes; offset += burst_bytes)
     {
-        ASSERT_TRUE(memory->addTransaction(is_write, base_address + offset, data));
+        auto* transaction = new Transaction(is_write ? DATA_WRITE : DATA_READ,
+                                            base_address + offset, data);
+        transaction->setSparseMetadata(request_type, dependency_base + offset / burst_bytes);
+        ASSERT_TRUE(memory->addTransaction(transaction));
     }
 }
 
@@ -314,28 +335,36 @@ BenchmarkResult runMemoryBenchmark(const CsrMatrix& matrix, const BenchmarkSpec&
     const TrafficPlan plan = makeTrafficPlan(matrix, spec);
     auto memory = std::make_shared<MultiChannelMemorySystem>(
         "ini/HBM2_samsung_2M_16B_x64.ini", spec.system_config, ".", spec.name, 256 * 64);
+    memory->setSparseSchedulingEnabled(spec.sparse_scheduler);
     const uint64_t burst_bytes =
         getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") * getConfigParam(UINT, "BL") / 8;
 
     BurstType data;
     uint64_t next_base = 0;
-    for (uint64_t stream_bytes : plan.packed_stream_bytes)
+    for (const PackedStream& stream : plan.packed_streams)
     {
         next_base = alignUp(next_base, burst_bytes);
-        addPackedTraffic(memory, false, next_base, stream_bytes, burst_bytes, &data);
-        next_base += stream_bytes;
+        addPackedTraffic(memory, false, next_base, stream.bytes, burst_bytes, &data,
+                         stream.request_type,
+                         stream.request_type == SPARSE_METADATA ? (1ULL << 63) : 0);
+        next_base += stream.bytes;
     }
 
     const uint64_t input_base = alignUp(next_base, burst_bytes);
-    for (uint32_t col : plan.input_columns)
+    for (size_t entry = 0; entry < plan.input_columns.size(); ++entry)
     {
+        const uint32_t col = plan.input_columns[entry];
         const uint64_t input_offset = static_cast<uint64_t>(col) * sizeof(float);
         const uint64_t input_burst = (input_offset / burst_bytes) * burst_bytes;
-        EXPECT_TRUE(memory->addTransaction(false, input_base + input_burst, &data));
+        auto* transaction = new Transaction(DATA_READ, input_base + input_burst, &data);
+        transaction->setSparseMetadata(SPARSE_VECTOR,
+                                       entry / std::max<uint64_t>(1, burst_bytes / sizeof(float)));
+        EXPECT_TRUE(memory->addTransaction(transaction));
     }
 
     const uint64_t output_base = alignUp(input_base + matrix.cols * sizeof(float), burst_bytes);
-    addPackedTraffic(memory, true, output_base, matrix.rows * sizeof(float), burst_bytes, &data);
+    addPackedTraffic(memory, true, output_base, matrix.rows * sizeof(float), burst_bytes, &data,
+                     SPARSE_OUTPUT);
 
     BenchmarkResult result;
     result.stored_entries = plan.stored_entries;
@@ -363,6 +392,14 @@ BenchmarkResult runMemoryBenchmark(const CsrMatrix& matrix, const BenchmarkSpec&
         {
             result.energy += value;
         }
+        const auto& scheduler = channel->memoryController->getSparseSchedulerStats();
+        result.sparse_scheduled += scheduler.sparseTransactions;
+        result.reordered += scheduler.reorderedTransactions;
+        result.row_hit_admissions += scheduler.rowHitAdmissions;
+        result.starvation_promotions += scheduler.starvationPromotions;
+        result.queue_wait += scheduler.totalQueueWait;
+        result.activates += channel->memoryController->getTotalActivates();
+        result.precharges += channel->memoryController->getTotalPrecharges();
     }
     result.average_channel_transactions =
         static_cast<double>(result.reads + result.writes) / memory->channels.size();
@@ -385,13 +422,19 @@ void printResult(const CsrMatrix& matrix, const BenchmarkSpec& spec,
               << result.cycles << ',' << result.reads << ',' << result.writes << ','
               << result.active_channels << ',' << result.max_channel_transactions << ','
               << result.average_channel_transactions << ',' << result.channel_imbalance << ','
-              << result.energy << std::endl;
+              << result.energy << ',' << (spec.sparse_scheduler ? "sparse" : "baseline") << ','
+              << result.sparse_scheduled << ',' << result.reordered << ','
+              << result.row_hit_admissions << ',' << result.starvation_promotions << ','
+              << (result.sparse_scheduled == 0
+                      ? 0.0
+                      : static_cast<double>(result.queue_wait) / result.sparse_scheduled)
+              << ',' << result.activates << ',' << result.precharges << std::endl;
 }
 
 TEST(SparseMatrixBaseline, csr_spmv_correctness)
 {
     const BenchmarkSpec spec{"smoke", "csr_correctness", 256, 256, "uniform", 8,
-                             "csr", "system_hbm.ini", 4, 570};
+                             "csr", "system_hbm.ini", 4, 570, true};
     const CsrMatrix matrix = makeMatrix(spec);
     std::vector<float> input(matrix.cols);
     for (uint32_t col = 0; col < matrix.cols; ++col)
@@ -412,6 +455,44 @@ TEST(SparseMatrixBaseline, csr_spmv_correctness)
     EXPECT_GT(result.cycles, 0U);
     EXPECT_GT(result.reads, 0U);
     EXPECT_GT(result.writes, 0U);
+    EXPECT_GT(result.sparse_scheduled, 0U);
+    EXPECT_GT(result.reordered, 0U);
+}
+
+TEST(SparseAwareScheduler, preserves_transaction_counts)
+{
+    BenchmarkSpec baseline{"smoke", "scheduler_baseline", 128, 256, "hotset", 16,
+                           "csr", "system_hbm.ini", 4, 570, false};
+    BenchmarkSpec scheduled = baseline;
+    scheduled.name = "scheduler_enabled";
+    scheduled.sparse_scheduler = true;
+    const CsrMatrix matrix = makeMatrix(baseline);
+
+    const BenchmarkResult baseline_result = runMemoryBenchmark(matrix, baseline);
+    const BenchmarkResult scheduled_result = runMemoryBenchmark(matrix, scheduled);
+    EXPECT_EQ(scheduled_result.reads, baseline_result.reads);
+    EXPECT_EQ(scheduled_result.writes, baseline_result.writes);
+    EXPECT_GT(scheduled_result.sparse_scheduled, 0U);
+    EXPECT_GT(scheduled_result.reordered, 0U);
+}
+
+TEST(SparseAwareScheduler, leaves_unlabelled_traffic_on_baseline_path)
+{
+    auto memory = std::make_shared<MultiChannelMemorySystem>(
+        "ini/HBM2_samsung_2M_16B_x64.ini", "system_hbm.ini", ".", "unlabelled", 256 * 64);
+    memory->setSparseSchedulingEnabled(true);
+    BurstType data;
+    for (uint64_t address = 0; address < 4096; address += 32)
+        ASSERT_TRUE(memory->addTransaction(false, address, &data));
+    while (memory->hasPendingTransactions())
+        memory->update();
+
+    for (auto* channel : memory->channels)
+    {
+        const auto& stats = channel->memoryController->getSparseSchedulerStats();
+        EXPECT_EQ(stats.sparseTransactions, 0U);
+        EXPECT_EQ(stats.reorderedTransactions, 0U);
+    }
 }
 
 TEST(SparseMatrixBenchmark, configured_case)

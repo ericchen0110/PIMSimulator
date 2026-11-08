@@ -10,7 +10,7 @@ mkdir -p "$(dirname "${result_file}")"
 echo "Building sparse benchmark executable" >&2
 (cd "${repo_root}" && scons -j8)
 
-header="group,name,pattern,format,system_config,rows,cols,nnz,density,stored_entries,cycles,reads,writes,active_channels,max_channel_transactions,average_channel_transactions,channel_imbalance,energy"
+header="group,name,pattern,format,system_config,rows,cols,nnz,density,stored_entries,cycles,reads,writes,active_channels,max_channel_transactions,average_channel_transactions,channel_imbalance,energy,scheduler,sparse_scheduled,reordered,row_hit_admissions,starvation_promotions,average_queue_wait,activates,precharges"
 printf '%s\n' "${header}" > "${result_file}"
 
 while IFS=, read -r group name rows cols pattern nnz_per_row format system_config block_size seed; do
@@ -29,6 +29,7 @@ while IFS=, read -r group name rows cols pattern nnz_per_row format system_confi
         SPMV_SYSTEM_CONFIG="${system_config}" \
         SPMV_BLOCK_SIZE="${block_size}" \
         SPMV_SEED="${seed}" \
+        SPMV_SCHEDULER="${SPMV_SCHEDULER:-sparse}" \
         ./sim --gtest_filter=SparseMatrixBenchmark.configured_case
     )"
 

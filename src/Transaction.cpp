@@ -41,14 +41,23 @@ using std::hex;
 namespace DRAMSim
 {
 Transaction::Transaction(TransactionType transType, uint64_t addr, BurstType* dat)
-    : transactionType(transType), address(addr), data(dat)
+    : transactionType(transType),
+      address(addr),
+      data(dat),
+      sparseRequestType(NON_SPARSE),
+      sparseDependencyId(0)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 }
 
 Transaction::Transaction(TransactionType transType, uint64_t addr, const std::string& str,
                          BurstType* dat)
-    : transactionType(transType), address(addr), tag(str), data(dat)
+    : transactionType(transType),
+      address(addr),
+      data(dat),
+      tag(str),
+      sparseRequestType(NON_SPARSE),
+      sparseDependencyId(0)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 }
@@ -58,7 +67,10 @@ Transaction::Transaction(const Transaction& t)
       address(t.address),
       data(NULL),
       timeAdded(t.timeAdded),
-      timeReturned(t.timeReturned)
+      timeReturned(t.timeReturned),
+      tag(t.tag),
+      sparseRequestType(t.sparseRequestType),
+      sparseDependencyId(t.sparseDependencyId)
 {
     rowBufferPolicy = PIMConfiguration::getRowBufferPolicy();
 #ifndef NO_STORAGE

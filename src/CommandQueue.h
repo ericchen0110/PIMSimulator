@@ -75,6 +75,7 @@ class CommandQueue : public SimulatorObject
     void print();
     void update();  // SimulatorObject requirement
     vector<BusPacket*>& getCommandQueue(unsigned rank, unsigned bank);
+    bool hasRowConflict(unsigned rank, unsigned bank, unsigned row);
 
     // fields
     BusPacket3D queues;  // 3D array of BusPacket pointers

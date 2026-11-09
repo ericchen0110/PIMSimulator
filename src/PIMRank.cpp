@@ -471,6 +471,24 @@ void PIMRank::doPIMBlock(BusPacket* packet, PIMCmd cCmd, int pimblock_id)
 
         writeOpd(pimblock_id, dstBst, cCmd.dst_, packet, cCmd.dstIdx_, cCmd.isAuto_, is_mac);
     }
+    else if (cCmd.type_ == PIMCmdType::LDIDX)
+    {
+        BurstType idxBst;
+        readOpd(pimblock_id, idxBst, cCmd.src0_, packet, cCmd.src0Idx_, false, false);
+        pimBlocks[pimblock_id].idx = idxBst;
+    }
+    else if (cCmd.type_ == PIMCmdType::SPMAC)
+    {
+        BurstType dstBst;
+        BurstType valBst;
+        BurstType gatheredBst;
+
+        readOpd(pimblock_id, valBst, cCmd.src0_, packet, cCmd.src0Idx_, false, true);
+        pimBlocks[pimblock_id].gather(gatheredBst);
+        readOpd(pimblock_id, dstBst, cCmd.dst_, packet, cCmd.dstIdx_, false, true);
+        pimBlocks[pimblock_id].mac(dstBst, valBst, gatheredBst);
+        writeOpd(pimblock_id, dstBst, cCmd.dst_, packet, cCmd.dstIdx_, false, true);
+    }
     else if (cCmd.type_ == PIMCmdType::NOP && packet->busPacketType == WRITE)
     {
         int grf_id = getGrfIdx(packet->column);

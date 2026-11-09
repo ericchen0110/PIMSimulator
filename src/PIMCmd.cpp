@@ -56,6 +56,7 @@ void PIMCmd::fromInt(uint32_t val)
         case PIMCmdType::ADD:
         case PIMCmdType::MUL:
         case PIMCmdType::MAC:
+        case PIMCmdType::SPMAC:
             dst_ = PIMOpdType(fromBit(val, 3, 25));
             src0_ = PIMOpdType(fromBit(val, 3, 22));
             src1_ = PIMOpdType(fromBit(val, 3, 19));
@@ -146,6 +147,7 @@ uint32_t PIMCmd::toInt() const
         case PIMCmdType::ADD:
         case PIMCmdType::MUL:
         case PIMCmdType::MAC:
+        case PIMCmdType::SPMAC:
             val |= toBit(int(dst_), 3, 25);
             val |= toBit(int(src0_), 3, 22);
             val |= toBit(int(src1_), 3, 19);
@@ -194,11 +196,11 @@ std::string PIMCmd::toStr() const
         case PIMCmdType::ADD:
         case PIMCmdType::MUL:
         case PIMCmdType::MAC:
+        case PIMCmdType::SPMAC:
             ss << opdToStr(dst_, dstIdx_) << ", ";
             ss << opdToStr(src0_, src0Idx_) << ", ";
             ss << opdToStr(src1_, src1Idx_);
-            break;
-
+            break; 
         case PIMCmdType::MAD:
             ss << opdToStr(dst_, dstIdx_) << ", ";
             ss << opdToStr(src0_, src0Idx_) << ", ";

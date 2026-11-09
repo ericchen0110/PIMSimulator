@@ -18,6 +18,40 @@
 #include "AddressMapping.h"
 #include "tests/PIMCmdGen.h"
 
+void PIMKernel::executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_bursts, int data_row,
+                                    int num_pairs, int result_row)
+{
+    setControl(&bst_hab_pim_, true, getToggleCond(), false, true);  // zero GRF_B
+    parkIn();
+    changePIMMode(dramMode::SB, dramMode::HAB);
+    programCrf(pim_cmds);
+    changePIMMode(dramMode::HAB, dramMode::HAB_PIM);
+
+    // Broadcast x into GRF_A. Reserved-row writes do not advance the CRF PC.
+    for (int& ch_idx : pim_chans_)
+    {
+        for (int& ra_idx : pim_ranks_)
+        {
+            for (int gidx = 0; gidx < num_grfA_; gidx++)
+            {
+                uint64_t addr =
+                    pim_addr_mgr_->addrGen(ch_idx, ra_idx, 0, 1, pim_reg_ra_, 0x8 + gidx);
+                mem_->addTransaction(true, addr, "WRIO_TO_GRF_", &x_bursts[gidx]);
+            }
+            mem_->addBarrier(ch_idx);
+        }
+    }
+
+    // Each pair is two READs: one LDIDX, one SPMAC.
+    addTransactionAll(false, 0, 0, data_row, 0, "SPMAC_", &null_bst_, true, 2 * num_pairs);
+    // NOP 7 turns these WRITEs into GRF_B[col & 7] -> odd bank.
+    addTransactionAll(true, 0, 1, result_row, 0, "GRFB_TO_BANK_", &null_bst_, true, num_grfB_);
+
+    changePIMMode(dramMode::HAB_PIM, dramMode::HAB);
+    changePIMMode(dramMode::HAB, dramMode::SB);
+    parkOut();
+}
+
 void PIMKernel::runPIM()
 {
     while (mem_->hasPendingTransactions())

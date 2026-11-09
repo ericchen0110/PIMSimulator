@@ -105,6 +105,8 @@ class PIMKernel
                     uint64_t baseAddr = 0, unsigned startingRow = 0, unsigned startingCol = 0);
     void readData(BurstType* bst_data, size_t bst_cnt, unsigned s_row = 0, unsigned s_col = 0);
     void adderTree(BurstType* result, int output_dim, int numTile, int step, fp16* temp);
+    void executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_bursts, int data_row,
+                         int num_pairs, int result_row);
 
   private:
     unsigned cycle_;

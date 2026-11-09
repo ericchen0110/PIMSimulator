@@ -17,14 +17,20 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <deque>
 
 #include "MultiChannelMemorySystem.h"
 #include "PIMCmd.h"
 #include "SystemConfiguration.h"
 #include "tests/KernelAddrGen.h"
+#include "tests/SpmvLayout.h"
 
 using namespace std;
 using namespace DRAMSim;
+struct SpmvStats
+{
+    uint64_t reads = 0, xWrites = 0, crfWrites = 0, ctlWrites = 0, flushWrites = 0;
+};
 
 class PIMKernel
 {
@@ -95,6 +101,11 @@ class PIMKernel
     void executeGemv(NumpyBurstType* w_data, NumpyBurstType* i_data, bool is_tree);
     void executeEltwise(int dim, pimBankType bank_types, KernelType ktype, int input0_row,
                         int result_row, int input1_row = 0);
+    void executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_bursts, int data_row,
+                         int num_pairs, int result_row);
+    void preloadSpmv(const SpmvLayout& layout);
+    SpmvStats executeSpmv(const SpmvLayout& layout, const vector<float>& x);
+    vector<float> readSpmvResult(const SpmvLayout& layout);
     void computeGemv(NumpyBurstType* data, int num_input_tiles, int num_output_tile, int input_tile,
                      int output_tile, int batch_idx, pimBankType bank_types);
     void computeAddOrMul(int numTile, int input0Row, int resultRow, int input1Row);
@@ -105,14 +116,15 @@ class PIMKernel
                     uint64_t baseAddr = 0, unsigned startingRow = 0, unsigned startingCol = 0);
     void readData(BurstType* bst_data, size_t bst_cnt, unsigned s_row = 0, unsigned s_col = 0);
     void adderTree(BurstType* result, int output_dim, int numTile, int step, fp16* temp);
-    void executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_bursts, int data_row,
-                         int num_pairs, int result_row);
 
   private:
     unsigned cycle_;
     unsigned num_banks_, num_pim_blocks_, num_bank_groups_, num_total_pim_blocks_;
     BurstType null_bst_, bst_hab_pim_, bst_hab_;
     BurstType crf_bst_[4];
+    deque<BurstType> spmv_bufs_;  // stable storage for bursts referenced by queued writes
+    vector<BurstType> spmv_result_;
+    vector<PIMCmd> spmvTileProgram(const SpmvTile& tile, bool last_in_session);
     BurstType* srf_bst_;
     vector<int> pim_chans_;
     vector<int> pim_ranks_;

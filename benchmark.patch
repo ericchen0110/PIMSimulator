@@ -1,0 +1,838 @@
+diff --git a/src/tests/PIMKernel.cpp b/src/tests/PIMKernel.cpp
+index fbad99e..b77f80e 100644
+--- a/src/tests/PIMKernel.cpp
++++ b/src/tests/PIMKernel.cpp
+@@ -475,6 +475,208 @@ void PIMKernel::executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_burst
+     parkOut();
+ }
+ 
++vector<PIMCmd> PIMKernel::spmvTileProgram(const SpmvTile& tile, bool last_in_session)
++{
++    vector<PIMCmd> cmds;
++    for (int d = 0; d < SpmvLayout::kSlots; d++)
++    {
++        if (tile.k[d] == 0)
++            continue;
++        cmds.push_back(PIMCmd(PIMCmdType::LDIDX, PIMOpdType::A_OUT, PIMOpdType::EVEN_BANK));
++        cmds.push_back(PIMCmd(PIMCmdType::SPMAC, PIMOpdType::GRF_B, PIMOpdType::EVEN_BANK,
++                              PIMOpdType::GRF_A, 0, d));
++        if (tile.k[d] > 1)
++            cmds.push_back(PIMCmd(PIMCmdType::JUMP, tile.k[d] - 1, 3));
++    }
++    if (last_in_session)
++        cmds.push_back(PIMCmd(PIMCmdType::NOP, 7));  // next 8 WRITEs flush GRF_B -> odd bank
++    cmds.push_back(PIMCmd(PIMCmdType::EXIT, 0));
++    return cmds;
++}
++
++// Writes each block's (idx, val) stream into its even bank, starting at row 0.
++void PIMKernel::preloadSpmv(const SpmvLayout& layout)
++{
++    int banks_per_group = num_banks_ / num_bank_groups_;
++    for (int ch = 0; ch < layout.numChans; ch++)
++        for (int b = 0; b < layout.numBlocks; b++)
++        {
++            const vector<BurstType>& s = layout.stream[ch][b];
++            int bank = 2 * b;
++            for (size_t pos = 0; pos < s.size(); pos++)
++            {
++                unsigned row = 0, col = pos;
++                uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, bank / banks_per_group,
++                                                           bank % banks_per_group, row, col);
++                mem_->addTransaction(true, addr, "SPMV_PRELOAD", const_cast<BurstType*>(&s[pos]));
++            }
++        }
++    addBarrier();
++}
++
++// One PIM session per (channel, group of 1024 rows). For each 128-column tile of x:
++//   1. broadcast the tile into GRF_A (8 writes)
++//   2. rewrite the CRF bursts that changed since the last tile
++//   3. reset the PC (and zero GRF_B on a session's first tile)
++//   4. issue 2 * sum(K) READs; the CRF pairs them as LDIDX, SPMAC
++// The last tile's program ends with NOP 7, so 8 WRITEs flush GRF_B into the odd bank.
++SpmvStats PIMKernel::executeSpmv(const SpmvLayout& layout, const vector<float>& x)
++{
++    SpmvStats st;
++    const int result_row = 0;  // odd banks hold only results
++    for (const SpmvChannelPlan& cp : layout.chans)
++        if (2 * cp.pairs >= (uint64_t)(1 << 13) * 128)
++            throw invalid_argument("SpMV data would reach the reserved rows of a bank");
++
++    BurstType* ctl_keep = &*spmv_bufs_.emplace(spmv_bufs_.end());
++    BurstType* ctl_zero = &*spmv_bufs_.emplace(spmv_bufs_.end());
++    setControl(ctl_keep, true, getToggleCond(), false, false);
++    setControl(ctl_zero, true, getToggleCond(), false, true);
++
++    setControl(&bst_hab_pim_, true, getToggleCond(), false, true);
++    parkIn();
++    changePIMMode(dramMode::SB, dramMode::HAB);
++    changePIMMode(dramMode::HAB, dramMode::HAB_PIM);
++
++    for (int ch = 0; ch < layout.numChans; ch++)
++    {
++        const SpmvChannelPlan& cp = layout.chans[ch];
++        unsigned data_pos = 0;
++        vector<uint32_t> crf_image;  // CRF contents currently programmed in this channel
++
++        for (size_t s = 0; s < cp.sessions.size(); s++)
++        {
++            const SpmvSession& ss = cp.sessions[s];
++            for (size_t ti = 0; ti < ss.tiles.size(); ti++)
++            {
++                const SpmvTile& tile = ss.tiles[ti];
++                bool last = (ti + 1 == ss.tiles.size());
++
++                // 1. x tile -> GRF_A
++                int c0 = cp.colBase + tile.tile * SpmvLayout::kTileCols;
++                for (int g = 0; g < num_grfA_; g++)
++                {
++                    BurstType* xb = &*spmv_bufs_.emplace(spmv_bufs_.end());
++                    for (int l = 0; l < 16; l++)
++                    {
++                        int j = c0 + g * 16 + l;
++                        xb->fp16Data_[l] =
++                            convertF2H(j < cp.colBase + cp.numCols ? x[j] : 0.0f);
++                    }
++                    mem_->addTransaction(
++                        true, pim_addr_mgr_->addrGen(ch, 0, 0, 1, pim_reg_ra_, 0x8 + g),
++                        "SPMV_X_TO_GRF_A", xb);
++                    st.xWrites++;
++                }
++
++                // 2. CRF
++                vector<PIMCmd> cmds = spmvTileProgram(tile, last);
++                vector<uint32_t> image(32, PIMCmd(PIMCmdType::NOP, 0).toInt());
++                for (size_t i = 0; i < cmds.size(); i++) image[i] = cmds[i].toInt();
++                for (size_t i = 0; i * 8 < cmds.size(); i++)
++                {
++                    bool same = !crf_image.empty() &&
++                                equal(image.begin() + i * 8, image.begin() + i * 8 + 8,
++                                      crf_image.begin() + i * 8);
++                    if (same)
++                        continue;
++                    BurstType* cb = &*spmv_bufs_.emplace(spmv_bufs_.end());
++                    for (int j = 0; j < 8; j++) cb->u32Data_[j] = image[i * 8 + j];
++                    mem_->addTransaction(
++                        true, pim_addr_mgr_->addrGen(ch, 0, 0, 1, pim_reg_ra_, 0x4 + i),
++                        "SPMV_PROGRAM_CRF", cb);
++                    st.crfWrites++;
++                }
++                if (crf_image.empty())
++                    crf_image = image;
++                else
++                    copy(image.begin(), image.begin() + ((cmds.size() + 7) / 8) * 8,
++                         crf_image.begin());
++
++                // 3. PC reset
++                mem_->addTransaction(true,
++                                     pim_addr_mgr_->addrGen(ch, 0, 0, 0, pim_reg_ra_, 0x0),
++                                     "SPMV_PC_RESET", (ti == 0) ? ctl_zero : ctl_keep);
++                st.ctlWrites++;
++                mem_->addBarrier(ch);
++
++                // 4. (idx, val) READs from the even banks
++                int pairs = 0;
++                for (int d = 0; d < SpmvLayout::kSlots; d++) pairs += tile.k[d];
++                for (int i = 0; i < 2 * pairs; i++, data_pos++)
++                {
++                    unsigned row = 0, col = data_pos;
++                    uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, 0, 0, row, col);
++                    mem_->addTransaction(false, addr, "SPMAC_", &null_bst_);
++                    st.reads++;
++                }
++                mem_->addBarrier(ch);
++            }
++
++            if (!ss.tiles.empty())
++            {
++                for (int d = 0; d < num_grfB_; d++)
++                {
++                    unsigned row = result_row, col = s * num_grfB_ + d;
++                    uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, 0, 1, row, col);
++                    mem_->addTransaction(true, addr, "SPMV_GRFB_TO_BANK", &null_bst_);
++                    st.flushWrites++;
++                }
++                mem_->addBarrier(ch);
++            }
++        }
++    }
++
++    changePIMMode(dramMode::HAB_PIM, dramMode::HAB);
++    changePIMMode(dramMode::HAB, dramMode::SB);
++    parkOut();
++    return st;
++}
++
++// Reads every flushed GRF_B burst, runs the simulator, and sums partial results per row.
++vector<float> PIMKernel::readSpmvResult(const SpmvLayout& layout)
++{
++    int banks_per_group = num_banks_ / num_bank_groups_;
++    struct Slot
++    {
++        int ch, s, d, b;
++    };
++    vector<Slot> slots;
++    for (int ch = 0; ch < layout.numChans; ch++)
++        for (size_t s = 0; s < layout.chans[ch].sessions.size(); s++)
++        {
++            const SpmvSession& ss = layout.chans[ch].sessions[s];
++            if (ss.tiles.empty())
++                continue;
++            for (int d = 0; d < ss.numSlots; d++)
++                for (int b = 0; b < layout.numBlocks; b++) slots.push_back({ch, (int)s, d, b});
++        }
++
++    spmv_result_.assign(slots.size(), BurstType());
++    for (size_t i = 0; i < slots.size(); i++)
++    {
++        int bank = 2 * slots[i].b + 1;
++        unsigned row = 0, col = slots[i].s * num_grfB_ + slots[i].d;
++        uint64_t addr = pim_addr_mgr_->addrGenSafe(slots[i].ch, 0, bank / banks_per_group,
++                                                   bank % banks_per_group, row, col);
++        mem_->addTransaction(false, addr, "SPMV_RESULT", &spmv_result_[i]);
++    }
++    runPIM();
++
++    vector<float> y(layout.rows, 0.0f);
++    for (size_t i = 0; i < slots.size(); i++)
++    {
++        const SpmvChannelPlan& cp = layout.chans[slots[i].ch];
++        for (int l = 0; l < SpmvLayout::kLanes; l++)
++        {
++            int local = layout.localRow(slots[i].s, slots[i].d, slots[i].b, l);
++            if (local < cp.numRows)
++                y[cp.rowBase + local] += convertH2F(spmv_result_[i].fp16Data_[l]);
++        }
++    }
++    return y;
++}
++
+ void PIMKernel::computeGemv(NumpyBurstType* data, int num_input_tiles, int num_output_tiles,
+                             int inputTile, int outputTile, int batchIdx, pimBankType pb_type)
+ {
+diff --git a/src/tests/PIMKernel.h b/src/tests/PIMKernel.h
+index 24ca932..3260c31 100644
+--- a/src/tests/PIMKernel.h
++++ b/src/tests/PIMKernel.h
+@@ -13,6 +13,7 @@
+ #ifndef __PIM_KERNEL_HPP__
+ #define __PIM_KERNEL_HPP__
+ 
++#include <deque>
+ #include <memory>
+ #include <sstream>
+ #include <string>
+@@ -22,10 +23,17 @@
+ #include "PIMCmd.h"
+ #include "SystemConfiguration.h"
+ #include "tests/KernelAddrGen.h"
++#include "tests/SpmvLayout.h"
+ 
+ using namespace std;
+ using namespace DRAMSim;
+ 
++// Commands issued per channel-summed category by executeSpmv.
++struct SpmvStats
++{
++    uint64_t reads = 0, xWrites = 0, crfWrites = 0, ctlWrites = 0, flushWrites = 0;
++};
++
+ class PIMKernel
+ {
+   public:
+@@ -97,6 +105,9 @@ class PIMKernel
+                         int result_row, int input1_row = 0);
+     void executeSpmacProgram(vector<PIMCmd>& pim_cmds, BurstType* x_bursts, int data_row,
+                              int num_pairs, int result_row);
++    void preloadSpmv(const SpmvLayout& layout);
++    SpmvStats executeSpmv(const SpmvLayout& layout, const vector<float>& x);
++    vector<float> readSpmvResult(const SpmvLayout& layout);
+     void computeGemv(NumpyBurstType* data, int num_input_tiles, int num_output_tile, int input_tile,
+                      int output_tile, int batch_idx, pimBankType bank_types);
+     void computeAddOrMul(int numTile, int input0Row, int resultRow, int input1Row);
+@@ -113,6 +124,9 @@ class PIMKernel
+     unsigned num_banks_, num_pim_blocks_, num_bank_groups_, num_total_pim_blocks_;
+     BurstType null_bst_, bst_hab_pim_, bst_hab_;
+     BurstType crf_bst_[4];
++    deque<BurstType> spmv_bufs_;  // stable storage for bursts referenced by queued writes
++    vector<BurstType> spmv_result_;
++    vector<PIMCmd> spmvTileProgram(const SpmvTile& tile, bool last_in_session);
+     BurstType* srf_bst_;
+     vector<int> pim_chans_;
+     vector<int> pim_ranks_;
+diff --git a/src/tests/SpmvLayout.h b/src/tests/SpmvLayout.h
+new file mode 100644
+index 0000000..b3ab392
+--- /dev/null
++++ b/src/tests/SpmvLayout.h
+@@ -0,0 +1,347 @@
++#ifndef __SPMV_LAYOUT_H__
++#define __SPMV_LAYOUT_H__
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <numeric>
++#include <random>
++#include <stdexcept>
++#include <vector>
++
++#include "Burst.h"
++#include "FP16.h"
++
++using namespace std;
++using namespace DRAMSim;
++
++// Sparse matrix in CSR form. Column indices within a row are sorted.
++struct CsrMatrix
++{
++    int rows = 0, cols = 0;
++    vector<int> rowPtr;
++    vector<int> colIdx;
++    vector<float> vals;
++
++    size_t nnz() const
++    {
++        return colIdx.size();
++    }
++
++    // Coefficient of variation of the row lengths (std / mean).
++    double rowLengthCv() const
++    {
++        double mean = (double)nnz() / rows, var = 0;
++        for (int r = 0; r < rows; r++)
++        {
++            double d = (rowPtr[r + 1] - rowPtr[r]) - mean;
++            var += d * d;
++        }
++        return mean > 0 ? sqrt(var / rows) / mean : 0;
++    }
++};
++
++// Values are multiples of 1/4 so FP16 products and short sums are exact.
++inline float spmvTestValue(uint32_t h)
++{
++    float v = 0.25f * (1 + (h % 4));
++    return (h & 4) ? -v : v;
++}
++
++inline vector<float> spmvTestVector(int n)
++{
++    vector<float> x(n);
++    for (int j = 0; j < n; j++) x[j] = 0.25f * ((j % 9) - 4);
++    return x;
++}
++
++inline CsrMatrix makeSparseFromRowLengths(int m, int n, const vector<int>& lengths, mt19937& rng)
++{
++    CsrMatrix a;
++    a.rows = m;
++    a.cols = n;
++    a.rowPtr.assign(m + 1, 0);
++    vector<int> all(n);
++    iota(all.begin(), all.end(), 0);
++    vector<char> used(n, 0);
++    vector<int> picked;
++    for (int r = 0; r < m; r++)
++    {
++        int len = min(lengths[r], n);
++        picked.clear();
++        if (len * 2 < n)
++        {
++            // Rejection sampling, then sort. Expected O(len) draws.
++            while ((int)picked.size() < len)
++            {
++                int c = (int)(rng() % n);
++                if (!used[c])
++                {
++                    used[c] = 1;
++                    picked.push_back(c);
++                }
++            }
++            for (int c : picked) used[c] = 0;
++            sort(picked.begin(), picked.end());
++        }
++        else
++        {
++            // Partial Fisher-Yates shuffle (std::sample needs C++17).
++            for (int i = 0; i < len; i++) swap(all[i], all[i + rng() % (n - i)]);
++            picked.assign(all.begin(), all.begin() + len);
++            sort(picked.begin(), picked.end());
++        }
++        for (int c : picked)
++        {
++            a.colIdx.push_back(c);
++            a.vals.push_back(spmvTestValue(rng()));
++        }
++        a.rowPtr[r + 1] = (int)a.colIdx.size();
++    }
++    return a;
++}
++
++// Every entry is nonzero with probability `density`.
++inline CsrMatrix makeUniformSparse(int m, int n, double density, uint32_t seed)
++{
++    mt19937 rng(seed);
++    binomial_distribution<int> len_dist(n, density);
++    vector<int> lengths(m);
++    for (int& l : lengths) l = len_dist(rng);
++    return makeSparseFromRowLengths(m, n, lengths, rng);
++}
++
++// Row lengths follow a Pareto distribution (shape alpha) with the same mean
++// as the uniform case, capped at n. Small alpha means a heavier tail.
++inline CsrMatrix makePowerLawSparse(int m, int n, double density, double alpha, uint32_t seed)
++{
++    mt19937 rng(seed);
++    uniform_real_distribution<double> u(0.0, 1.0);
++    vector<double> w(m);
++    for (double& v : w) v = pow(1.0 - u(rng), -1.0 / alpha);
++    double target = density * n * m;
++    // Rescale so the capped total matches the target number of nonzeros.
++    double scale = target / accumulate(w.begin(), w.end(), 0.0);
++    vector<int> lengths(m);
++    for (int iter = 0; iter < 20; iter++)
++    {
++        double total = 0;
++        for (int r = 0; r < m; r++)
++        {
++            lengths[r] = (int)min<double>(n, floor(w[r] * scale + u(rng)));
++            total += lengths[r];
++        }
++        if (total <= 0 || fabs(total - target) < 0.005 * target)
++            break;
++        scale *= target / total;
++    }
++    return makeSparseFromRowLengths(m, n, lengths, rng);
++}
++
++// How a sparse matrix is laid out across PIM channels, blocks, lanes and GRF_B slots.
++//
++// Each lane of each PIM block owns one matrix row (or one column segment of a row).
++// Channels form a grid: rowParts x colParts. Channel ch = p * colParts + q handles
++// rows of row partition p and columns of column partition q. The host adds the
++// colParts partial sums of each row. colParts is chosen so every channel has about
++// 1024 rows (8 blocks x 8 GRF_B slots x 16 lanes), which fills one PIM session.
++//
++// Within a channel, local row i maps to
++//   session s = i / 1024, slot d = (i % 1024) / 128, block b = (i % 128) / 16, lane l = i % 16
++// For each 128-column tile of x (one full GRF_A), slot d needs K[d] (LDIDX, SPMAC) pairs,
++// where K[d] is the most nonzeros any of its 128 rows has in that tile. All 8 blocks run in
++// lockstep, so shorter rows are padded with (idx 0, val 0).
++struct SpmvTile
++{
++    int tile;  // tile index within the channel's column partition
++    int k[8];  // pairs per GRF_B slot
++};
++
++struct SpmvSession
++{
++    int numSlots = 0;
++    vector<SpmvTile> tiles;  // only tiles with at least one nonzero
++};
++
++struct SpmvChannelPlan
++{
++    int rowBase = 0, numRows = 0, colBase = 0, numCols = 0;
++    vector<SpmvSession> sessions;
++    uint64_t pairs = 0;  // (LDIDX, SPMAC) pairs issued by this channel
++};
++
++class SpmvLayout
++{
++  public:
++    static const int kLanes = 16;
++    static const int kSlots = 8;
++    static const int kTileCols = 128;
++
++    SpmvLayout(const CsrMatrix& a, int num_chans, int num_blocks, bool keep_data)
++        : rows(a.rows), cols(a.cols), numChans(num_chans), numBlocks(num_blocks), nnz(a.nnz())
++    {
++        int rows_per_session = kSlots * numBlocks * kLanes;
++        rowParts = 1;
++        while (rowParts * 2 <= numChans && (int64_t)rowParts * 2 * rows_per_session <= rows)
++            rowParts *= 2;
++        if (numChans % rowParts != 0)
++            throw invalid_argument("channel count must be a power of two");
++        colParts = numChans / rowParts;
++
++        int rows_per_part = (rows + rowParts - 1) / rowParts;
++        int cols_per_part = (cols + colParts - 1) / colParts;
++        cols_per_part = (cols_per_part + kTileCols - 1) / kTileCols * kTileCols;
++
++        chans.resize(numChans);
++        if (keep_data)
++            stream.assign(numChans, vector<vector<BurstType>>(numBlocks));
++
++        for (int ch = 0; ch < numChans; ch++)
++        {
++            SpmvChannelPlan& cp = chans[ch];
++            int p = ch / colParts, q = ch % colParts;
++            cp.rowBase = min(rows, p * rows_per_part);
++            cp.numRows = min(rows, cp.rowBase + rows_per_part) - cp.rowBase;
++            cp.colBase = min(cols, q * cols_per_part);
++            cp.numCols = min(cols, cp.colBase + cols_per_part) - cp.colBase;
++            planChannel(a, ch, rows_per_session, keep_data);
++            paddedPairs += cp.pairs;
++        }
++    }
++
++    // Local row -> placement inside a channel.
++    void place(int local_row, int& session, int& slot, int& block, int& lane) const
++    {
++        int rows_per_session = kSlots * numBlocks * kLanes;
++        session = local_row / rows_per_session;
++        int r = local_row % rows_per_session;
++        slot = r / (numBlocks * kLanes);
++        block = (r % (numBlocks * kLanes)) / kLanes;
++        lane = r % kLanes;
++    }
++
++    int localRow(int session, int slot, int block, int lane) const
++    {
++        return ((session * kSlots + slot) * numBlocks + block) * kLanes + lane;
++    }
++
++    // Fraction of issued lane-operations that carried a real nonzero.
++    double laneFill() const
++    {
++        return paddedPairs ? (double)nnz / ((double)paddedPairs * numBlocks * kLanes) : 0;
++    }
++
++    int rows, cols, numChans, numBlocks;
++    int rowParts = 1, colParts = 1;
++    uint64_t nnz = 0, paddedPairs = 0;
++    vector<SpmvChannelPlan> chans;
++    // stream[ch][block] = bursts to preload into that block's even bank, in issue order:
++    // idx, val, idx, val, ...
++    vector<vector<vector<BurstType>>> stream;
++
++  private:
++    void planChannel(const CsrMatrix& a, int ch, int rows_per_session, bool keep_data)
++    {
++        SpmvChannelPlan& cp = chans[ch];
++        if (cp.numRows <= 0 || cp.numCols <= 0)
++            return;
++        int num_tiles = (cp.numCols + kTileCols - 1) / kTileCols;
++        int num_sessions = (cp.numRows + rows_per_session - 1) / rows_per_session;
++        int col_end = cp.colBase + cp.numCols;
++
++        // first[i] = CSR position of local row i's first entry in this column partition.
++        vector<int> first(cp.numRows), last(cp.numRows);
++        for (int i = 0; i < cp.numRows; i++)
++        {
++            int r = cp.rowBase + i;
++            auto b = a.colIdx.begin() + a.rowPtr[r], e = a.colIdx.begin() + a.rowPtr[r + 1];
++            first[i] = (int)(lower_bound(b, e, cp.colBase) - a.colIdx.begin());
++            last[i] = (int)(lower_bound(b, e, col_end) - a.colIdx.begin());
++        }
++
++        cp.sessions.resize(num_sessions);
++        vector<int> cursor(first);
++        for (int s = 0; s < num_sessions; s++)
++        {
++            SpmvSession& ss = cp.sessions[s];
++            int session_rows = min(rows_per_session, cp.numRows - s * rows_per_session);
++            ss.numSlots = (session_rows + numBlocks * kLanes - 1) / (numBlocks * kLanes);
++
++            for (int t = 0; t < num_tiles; t++)
++            {
++                int tile_end = cp.colBase + (t + 1) * kTileCols;
++                SpmvTile tile;
++                tile.tile = t;
++                int any = 0;
++                for (int d = 0; d < kSlots; d++)
++                {
++                    tile.k[d] = 0;
++                    for (int b = 0; b < numBlocks; b++)
++                        for (int l = 0; l < kLanes; l++)
++                        {
++                            int i = localRow(s, d, b, l);
++                            if (i >= cp.numRows)
++                                continue;
++                            int c = cursor[i], n = 0;
++                            while (c < last[i] && a.colIdx[c] < tile_end) c++, n++;
++                            tile.k[d] = max(tile.k[d], n);
++                        }
++                    any += tile.k[d];
++                }
++                if (any == 0)
++                    continue;
++
++                for (int d = 0; d < kSlots; d++)
++                {
++                    cp.pairs += tile.k[d];
++                    if (!keep_data)
++                        continue;
++                    for (int k = 0; k < tile.k[d]; k++)
++                        for (int b = 0; b < numBlocks; b++)
++                        {
++                            BurstType idx, val;
++                            for (int l = 0; l < kLanes; l++)
++                            {
++                                idx.u16Data_[l] = 0;
++                                val.fp16Data_[l] = convertF2H(0.0f);
++                                int i = localRow(s, d, b, l);
++                                if (i >= cp.numRows)
++                                    continue;
++                                int c = cursor[i] + k;
++                                if (c < last[i] && a.colIdx[c] < tile_end)
++                                {
++                                    idx.u16Data_[l] = a.colIdx[c] - (tile_end - kTileCols);
++                                    val.fp16Data_[l] = convertF2H(a.vals[c]);
++                                }
++                            }
++                            stream[ch][b].push_back(idx);
++                            stream[ch][b].push_back(val);
++                        }
++                }
++                // Advance every row of this session past the tile.
++                for (int d = 0; d < kSlots; d++)
++                    for (int b = 0; b < numBlocks; b++)
++                        for (int l = 0; l < kLanes; l++)
++                        {
++                            int i = localRow(s, d, b, l);
++                            if (i >= cp.numRows)
++                                continue;
++                            while (cursor[i] < last[i] && a.colIdx[cursor[i]] < tile_end)
++                                cursor[i]++;
++                        }
++                ss.tiles.push_back(tile);
++            }
++        }
++    }
++};
++
++// Reference y = A x in float.
++inline vector<float> spmvReference(const CsrMatrix& a, const vector<float>& x)
++{
++    vector<float> y(a.rows, 0.0f);
++    for (int r = 0; r < a.rows; r++)
++        for (int c = a.rowPtr[r]; c < a.rowPtr[r + 1]; c++) y[r] += a.vals[c] * x[a.colIdx[c]];
++    return y;
++}
++
++#endif /* __SPMV_LAYOUT_H__ */
+diff --git a/src/tests/SpmvTestCases.cpp b/src/tests/SpmvTestCases.cpp
+new file mode 100644
+index 0000000..7ed9260
+--- /dev/null
++++ b/src/tests/SpmvTestCases.cpp
+@@ -0,0 +1,216 @@
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++#include "gtest/gtest.h"
++#include "tests/PIMKernel.h"
++
++using namespace DRAMSim;
++
++namespace
++{
++const char* kDeviceIni = "ini/HBM2_samsung_2M_16B_x64.ini";
++
++shared_ptr<MultiChannelMemorySystem> makeMem(int num_chans)
++{
++    const char* sys = (num_chans == 1) ? "system_hbm_1ch.ini" : "system_hbm_64ch.ini";
++    return make_shared<MultiChannelMemorySystem>(kDeviceIni, sys, ".", "example_app",
++                                                 256 * num_chans * 2);
++}
++
++// Preloads A, runs SPMAC SpMV, reads y back, and compares with a float reference.
++void checkSpmv(const CsrMatrix& a, int num_chans)
++{
++    auto mem = makeMem(num_chans);
++    auto kernel = make_shared<PIMKernel>(mem, num_chans, 1);
++    SpmvLayout layout(a, num_chans, getConfigParam(UINT, "NUM_PIM_BLOCKS"), true);
++    vector<float> x = spmvTestVector(a.cols);
++
++    kernel->preloadSpmv(layout);
++    kernel->runPIM();
++    uint64_t before = kernel->getCycle();
++    kernel->executeSpmv(layout, x);
++    kernel->runPIM();
++    uint64_t cycles = kernel->getCycle() - before;
++    vector<float> y = kernel->readSpmvResult(layout);
++
++    vector<float> ref = spmvReference(a, x);
++    int bad = 0;
++    for (int r = 0; r < a.rows; r++)
++    {
++        if (fabs(y[r] - ref[r]) > 1e-3f * max(1.0f, fabs(ref[r])))
++        {
++            if (bad++ < 10)
++                ADD_FAILURE() << "row " << r << ": pim " << y[r] << " ref " << ref[r];
++        }
++    }
++    EXPECT_EQ(bad, 0);
++    cout << "  " << a.rows << "x" << a.cols << " nnz " << a.nnz() << " on " << num_chans
++         << " ch: grid " << layout.rowParts << "x" << layout.colParts << ", lane fill "
++         << layout.laneFill() << ", " << cycles << " cycles" << endl;
++}
++}  // namespace
++
++TEST(SpmvKernel, oneChannelMultipleSessions)
++{
++    // 2300 rows -> 3 sessions on one channel; 300 cols -> 3 tiles, the last one partial.
++    checkSpmv(makeUniformSparse(2300, 300, 0.03, 1), 1);
++}
++
++TEST(SpmvKernel, oneChannelPowerLawRows)
++{
++    checkSpmv(makePowerLawSparse(700, 600, 0.02, 1.5, 2), 1);
++}
++
++TEST(SpmvKernel, sixtyFourChannelGrid)
++{
++    // 4 row partitions x 16 column partitions; only 8 column partitions get columns.
++    checkSpmv(makeUniformSparse(4096, 1000, 0.01, 3), 64);
++}
++
++TEST(SpmvKernel, sixtyFourChannelPowerLaw)
++{
++    checkSpmv(makePowerLawSparse(2048, 2048, 0.01, 1.5, 4), 64);
++}
++
++// ---------------------------------------------------------------------------
++// Benchmark: SPMAC SpMV vs dense PIM GEMV (MAC) vs non-PIM host, on 64 channels.
++//
++// Environment variables (all optional):
++//   SPMV_SIZES      e.g. "4096x4096,8192x8192"         (rows x cols)
++//   SPMV_DENSITIES  e.g. "0.001,0.01,0.1"
++//   SPMV_DISTS      "uniform", "powerlaw", or both
++//   SPMV_ALPHA      Pareto shape for powerlaw rows (default 1.5)
++//   SPMV_CSV        output file (default spmv_bench.csv)
++//
++// Like PIMBenchFixture, every number excludes moving the matrix into DRAM: the
++// matrix is assumed resident, and only the kernel's own commands are timed.
++// ---------------------------------------------------------------------------
++namespace
++{
++vector<string> splitList(const char* env, const string& dflt)
++{
++    string s = env ? env : dflt;
++    vector<string> out;
++    stringstream ss(s);
++    string item;
++    while (getline(ss, item, ','))
++        if (!item.empty())
++            out.push_back(item);
++    return out;
++}
++
++uint64_t runToIdle(shared_ptr<MultiChannelMemorySystem> mem)
++{
++    uint64_t cycle = 0;
++    while (mem->hasPendingTransactions())
++    {
++        mem->update();
++        cycle++;
++    }
++    return cycle;
++}
++
++// Same traffic model as PIMBenchTestCase::genMemTraffic: stream bytes linearly.
++uint64_t streamTraffic(shared_ptr<MultiChannelMemorySystem> mem, bool is_write, uint64_t bytes,
++                       uint64_t start, BurstType* bst)
++{
++    unsigned stride = getConfigParam(UINT, "JEDEC_DATA_BUS_BITS") * getConfigParam(UINT, "BL") / 8;
++    uint64_t addr;
++    for (addr = start; addr < start + bytes; addr += stride) mem->addTransaction(is_write, addr, bst);
++    return addr;
++}
++
++// Host reads inputs, then writes the output, as the existing GEMV bench does.
++uint64_t nonPimCycles(uint64_t read_bytes, uint64_t write_bytes)
++{
++    auto mem = makeMem(64);
++    BurstType bst;
++    uint64_t addr = streamTraffic(mem, false, read_bytes, 0, &bst);
++    uint64_t cycles = runToIdle(mem);
++    streamTraffic(mem, true, write_bytes, addr, &bst);
++    return cycles + runToIdle(mem);
++}
++
++uint64_t denseGemvPimCycles(int m, int n)
++{
++    auto mem = makeMem(64);
++    auto kernel = make_shared<PIMKernel>(mem, 64, 1);
++    NumpyBurstType w, in;
++    w.bShape = {(unsigned long)m, (unsigned long)(n / 16)};
++    int in_tiles = (n / 16 + 7) / 8;
++    in.bShape = {1, (unsigned long)(n / 16)};
++    in.bData.resize(in_tiles * 8);
++    kernel->executeGemv(&w, &in, false);
++    kernel->runPIM();
++    return kernel->getCycle();
++}
++}  // namespace
++
++TEST(SpmvBench, sweep)
++{
++    vector<string> sizes = splitList(getenv("SPMV_SIZES"), "4096x4096");
++    vector<string> dens = splitList(getenv("SPMV_DENSITIES"),
++                                    "0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.3,0.5");
++    vector<string> dists = splitList(getenv("SPMV_DISTS"), "uniform,powerlaw");
++    double alpha = getenv("SPMV_ALPHA") ? atof(getenv("SPMV_ALPHA")) : 1.5;
++    string csv_path = getenv("SPMV_CSV") ? getenv("SPMV_CSV") : "spmv_bench.csv";
++
++    ofstream csv(csv_path);
++    csv << "rows,cols,dist,density,nnz,row_len_cv,grid,lane_fill,padded_pairs,"
++           "spmac_reads,x_writes,crf_writes,pc_writes,flush_writes,"
++           "cyc_spmac,cyc_pim_gemv,cyc_host_dense,cyc_host_csr,"
++           "speedup_vs_pim_gemv,speedup_vs_host_csr,speedup_vs_host_dense"
++        << endl;
++
++    for (const string& size : sizes)
++    {
++        int m = stoi(size.substr(0, size.find('x')));
++        int n = stoi(size.substr(size.find('x') + 1));
++        uint64_t cyc_gemv = denseGemvPimCycles(m, n);
++        uint64_t cyc_host_dense = nonPimCycles((uint64_t)m * n * 2 + (uint64_t)n * 2, (uint64_t)m * 2);
++        cout << "[" << m << "x" << n << "] dense PIM GEMV " << cyc_gemv << " cycles, host dense "
++             << cyc_host_dense << " cycles" << endl;
++
++        for (const string& dist : dists)
++            for (const string& dstr : dens)
++            {
++                double d = stod(dstr);
++                auto t0 = chrono::steady_clock::now();
++                CsrMatrix a = (dist == "powerlaw") ? makePowerLawSparse(m, n, d, alpha, 42)
++                                                   : makeUniformSparse(m, n, d, 42);
++
++                auto mem = makeMem(64);
++                auto kernel = make_shared<PIMKernel>(mem, 64, 1);
++                SpmvLayout layout(a, 64, getConfigParam(UINT, "NUM_PIM_BLOCKS"), false);
++                SpmvStats st = kernel->executeSpmv(layout, spmvTestVector(n));
++                kernel->runPIM();
++                uint64_t cyc_spmac = kernel->getCycle();
++
++                // CSR on the host: FP16 values, 16-bit column indices, 32-bit row pointers, x.
++                uint64_t csr_bytes = a.nnz() * 4 + (uint64_t)(m + 1) * 4 + (uint64_t)n * 2;
++                uint64_t cyc_csr = nonPimCycles(csr_bytes, (uint64_t)m * 2);
++
++                double secs =
++                    chrono::duration<double>(chrono::steady_clock::now() - t0).count();
++                csv << m << "," << n << "," << dist << "," << d << "," << a.nnz() << ","
++                    << a.rowLengthCv() << "," << layout.rowParts << "x" << layout.colParts << ","
++                    << layout.laneFill() << "," << layout.paddedPairs << "," << st.reads << ","
++                    << st.xWrites << "," << st.crfWrites << "," << st.ctlWrites << ","
++                    << st.flushWrites << "," << cyc_spmac << "," << cyc_gemv << ","
++                    << cyc_host_dense << "," << cyc_csr << ","
++                    << (double)cyc_gemv / cyc_spmac << "," << (double)cyc_csr / cyc_spmac << ","
++                    << (double)cyc_host_dense / cyc_spmac << endl;
++                cout << fixed << setprecision(3) << "  " << dist << " d=" << d
++                     << " nnz=" << a.nnz() << " fill=" << layout.laneFill()
++                     << " spmac=" << cyc_spmac << " csr=" << cyc_csr
++                     << " vsGEMV=" << (double)cyc_gemv / cyc_spmac
++                     << " vsCSR=" << (double)cyc_csr / cyc_spmac << " (" << secs << "s)"
++                     << defaultfloat << endl;
++            }
++    }
++}

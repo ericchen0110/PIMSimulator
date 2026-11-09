@@ -475,6 +475,208 @@ void PIMKernel::executeGemv(NumpyBurstType* w_data, NumpyBurstType* i_data, bool
     parkOut();
 }
 
+vector<PIMCmd> PIMKernel::spmvTileProgram(const SpmvTile& tile, bool last_in_session)
+{
+    vector<PIMCmd> cmds;
+    for (int d = 0; d < SpmvLayout::kSlots; d++)
+    {
+        if (tile.k[d] == 0)
+            continue;
+        cmds.push_back(PIMCmd(PIMCmdType::LDIDX, PIMOpdType::A_OUT, PIMOpdType::EVEN_BANK));
+        cmds.push_back(PIMCmd(PIMCmdType::SPMAC, PIMOpdType::GRF_B, PIMOpdType::EVEN_BANK,
+                              PIMOpdType::GRF_A, 0, d));
+        if (tile.k[d] > 1)
+            cmds.push_back(PIMCmd(PIMCmdType::JUMP, tile.k[d] - 1, 3));
+    }
+    if (last_in_session)
+        cmds.push_back(PIMCmd(PIMCmdType::NOP, 7));  // next 8 WRITEs flush GRF_B -> odd bank
+    cmds.push_back(PIMCmd(PIMCmdType::EXIT, 0));
+    return cmds;
+}
+
+// Writes each block's (idx, val) stream into its even bank, starting at row 0.
+void PIMKernel::preloadSpmv(const SpmvLayout& layout)
+{
+    int banks_per_group = num_banks_ / num_bank_groups_;
+    for (int ch = 0; ch < layout.numChans; ch++)
+        for (int b = 0; b < layout.numBlocks; b++)
+        {
+            const vector<BurstType>& s = layout.stream[ch][b];
+            int bank = 2 * b;
+            for (size_t pos = 0; pos < s.size(); pos++)
+            {
+                unsigned row = 0, col = pos;
+                uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, bank / banks_per_group,
+                                                           bank % banks_per_group, row, col);
+                mem_->addTransaction(true, addr, "SPMV_PRELOAD", const_cast<BurstType*>(&s[pos]));
+            }
+        }
+    addBarrier();
+}
+
+// One PIM session per (channel, group of 1024 rows). For each 128-column tile of x:
+//   1. broadcast the tile into GRF_A (8 writes)
+//   2. rewrite the CRF bursts that changed since the last tile
+//   3. reset the PC (and zero GRF_B on a session's first tile)
+//   4. issue 2 * sum(K) READs; the CRF pairs them as LDIDX, SPMAC
+// The last tile's program ends with NOP 7, so 8 WRITEs flush GRF_B into the odd bank.
+SpmvStats PIMKernel::executeSpmv(const SpmvLayout& layout, const vector<float>& x)
+{
+    SpmvStats st;
+    const int result_row = 0;  // odd banks hold only results
+    for (const SpmvChannelPlan& cp : layout.chans)
+        if (2 * cp.pairs >= (uint64_t)(1 << 13) * 128)
+            throw invalid_argument("SpMV data would reach the reserved rows of a bank");
+
+    BurstType* ctl_keep = &*spmv_bufs_.emplace(spmv_bufs_.end());
+    BurstType* ctl_zero = &*spmv_bufs_.emplace(spmv_bufs_.end());
+    setControl(ctl_keep, true, getToggleCond(), false, false);
+    setControl(ctl_zero, true, getToggleCond(), false, true);
+
+    setControl(&bst_hab_pim_, true, getToggleCond(), false, true);
+    parkIn();
+    changePIMMode(dramMode::SB, dramMode::HAB);
+    changePIMMode(dramMode::HAB, dramMode::HAB_PIM);
+
+    for (int ch = 0; ch < layout.numChans; ch++)
+    {
+        const SpmvChannelPlan& cp = layout.chans[ch];
+        unsigned data_pos = 0;
+        vector<uint32_t> crf_image;  // CRF contents currently programmed in this channel
+
+        for (size_t s = 0; s < cp.sessions.size(); s++)
+        {
+            const SpmvSession& ss = cp.sessions[s];
+            for (size_t ti = 0; ti < ss.tiles.size(); ti++)
+            {
+                const SpmvTile& tile = ss.tiles[ti];
+                bool last = (ti + 1 == ss.tiles.size());
+
+                // 1. x tile -> GRF_A
+                int c0 = cp.colBase + tile.tile * SpmvLayout::kTileCols;
+                for (int g = 0; g < num_grfA_; g++)
+                {
+                    BurstType* xb = &*spmv_bufs_.emplace(spmv_bufs_.end());
+                    for (int l = 0; l < 16; l++)
+                    {
+                        int j = c0 + g * 16 + l;
+                        xb->fp16Data_[l] =
+                            convertF2H(j < cp.colBase + cp.numCols ? x[j] : 0.0f);
+                    }
+                    mem_->addTransaction(
+                        true, pim_addr_mgr_->addrGen(ch, 0, 0, 1, pim_reg_ra_, 0x8 + g),
+                        "SPMV_X_TO_GRF_A", xb);
+                    st.xWrites++;
+                }
+
+                // 2. CRF
+                vector<PIMCmd> cmds = spmvTileProgram(tile, last);
+                vector<uint32_t> image(32, PIMCmd(PIMCmdType::NOP, 0).toInt());
+                for (size_t i = 0; i < cmds.size(); i++) image[i] = cmds[i].toInt();
+                for (size_t i = 0; i * 8 < cmds.size(); i++)
+                {
+                    bool same = !crf_image.empty() &&
+                                equal(image.begin() + i * 8, image.begin() + i * 8 + 8,
+                                      crf_image.begin() + i * 8);
+                    if (same)
+                        continue;
+                    BurstType* cb = &*spmv_bufs_.emplace(spmv_bufs_.end());
+                    for (int j = 0; j < 8; j++) cb->u32Data_[j] = image[i * 8 + j];
+                    mem_->addTransaction(
+                        true, pim_addr_mgr_->addrGen(ch, 0, 0, 1, pim_reg_ra_, 0x4 + i),
+                        "SPMV_PROGRAM_CRF", cb);
+                    st.crfWrites++;
+                }
+                if (crf_image.empty())
+                    crf_image = image;
+                else
+                    copy(image.begin(), image.begin() + ((cmds.size() + 7) / 8) * 8,
+                         crf_image.begin());
+
+                // 3. PC reset
+                mem_->addTransaction(true,
+                                     pim_addr_mgr_->addrGen(ch, 0, 0, 0, pim_reg_ra_, 0x0),
+                                     "SPMV_PC_RESET", (ti == 0) ? ctl_zero : ctl_keep);
+                st.ctlWrites++;
+                mem_->addBarrier(ch);
+
+                // 4. (idx, val) READs from the even banks
+                int pairs = 0;
+                for (int d = 0; d < SpmvLayout::kSlots; d++) pairs += tile.k[d];
+                for (int i = 0; i < 2 * pairs; i++, data_pos++)
+                {
+                    unsigned row = 0, col = data_pos;
+                    uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, 0, 0, row, col);
+                    mem_->addTransaction(false, addr, "SPMAC_", &null_bst_);
+                    st.reads++;
+                }
+                mem_->addBarrier(ch);
+            }
+
+            if (!ss.tiles.empty())
+            {
+                for (int d = 0; d < num_grfB_; d++)
+                {
+                    unsigned row = result_row, col = s * num_grfB_ + d;
+                    uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, 0, 1, row, col);
+                    mem_->addTransaction(true, addr, "SPMV_GRFB_TO_BANK", &null_bst_);
+                    st.flushWrites++;
+                }
+                mem_->addBarrier(ch);
+            }
+        }
+    }
+
+    changePIMMode(dramMode::HAB_PIM, dramMode::HAB);
+    changePIMMode(dramMode::HAB, dramMode::SB);
+    parkOut();
+    return st;
+}
+
+// Reads every flushed GRF_B burst, runs the simulator, and sums partial results per row.
+vector<float> PIMKernel::readSpmvResult(const SpmvLayout& layout)
+{
+    int banks_per_group = num_banks_ / num_bank_groups_;
+    struct Slot
+    {
+        int ch, s, d, b;
+    };
+    vector<Slot> slots;
+    for (int ch = 0; ch < layout.numChans; ch++)
+        for (size_t s = 0; s < layout.chans[ch].sessions.size(); s++)
+        {
+            const SpmvSession& ss = layout.chans[ch].sessions[s];
+            if (ss.tiles.empty())
+                continue;
+            for (int d = 0; d < ss.numSlots; d++)
+                for (int b = 0; b < layout.numBlocks; b++) slots.push_back({ch, (int)s, d, b});
+        }
+
+    spmv_result_.assign(slots.size(), BurstType());
+    for (size_t i = 0; i < slots.size(); i++)
+    {
+        int bank = 2 * slots[i].b + 1;
+        unsigned row = 0, col = slots[i].s * num_grfB_ + slots[i].d;
+        uint64_t addr = pim_addr_mgr_->addrGenSafe(slots[i].ch, 0, bank / banks_per_group,
+                                                   bank % banks_per_group, row, col);
+        mem_->addTransaction(false, addr, "SPMV_RESULT", &spmv_result_[i]);
+    }
+    runPIM();
+
+    vector<float> y(layout.rows, 0.0f);
+    for (size_t i = 0; i < slots.size(); i++)
+    {
+        const SpmvChannelPlan& cp = layout.chans[slots[i].ch];
+        for (int l = 0; l < SpmvLayout::kLanes; l++)
+        {
+            int local = layout.localRow(slots[i].s, slots[i].d, slots[i].b, l);
+            if (local < cp.numRows)
+                y[cp.rowBase + local] += convertH2F(spmv_result_[i].fp16Data_[l]);
+        }
+    }
+    return y;
+}
+
 void PIMKernel::computeGemv(NumpyBurstType* data, int num_input_tiles, int num_output_tiles,
                             int inputTile, int outputTile, int batchIdx, pimBankType pb_type)
 {

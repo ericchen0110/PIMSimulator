@@ -31,6 +31,7 @@
 #ifndef TRANSACTION_H
 #define TRANSACTION_H
 
+#include <functional>
 #include <string>
 
 #include "BusPacket.h"
@@ -59,6 +60,8 @@ class Transaction
     uint64_t timeAdded;
     uint64_t timeReturned;
     std::string tag;
+    // Optional device-owned completion; legacy transactions leave this empty.
+    std::function<void()> onComplete;
 
     friend ostream& operator<<(ostream& os, const Transaction& t);
     // functions

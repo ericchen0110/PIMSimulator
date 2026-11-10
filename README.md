@@ -1,5 +1,8 @@
 # PIMSimulator
 
+For the optional sparse lockstep/independent control experiment, benchmark commands,
+and energy-model assumptions, see [independent PIM control](docs/independent_pim_control.md).
+
 ## Contents
 
   [1. Overview](#1-overview)  

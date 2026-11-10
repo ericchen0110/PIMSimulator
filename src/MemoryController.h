@@ -69,6 +69,11 @@ class MemoryController : public SimulatorObject
     bool WillAcceptTransaction();
     bool addBarrier();
 
+    // Monotonic, independent of the existing epoch-reset statistics.
+    struct Activity
+    {
+        uint64_t reads = 0, writes = 0, activates = 0, precharges = 0, refreshes = 0;
+    } activity;
     // fields
     vector<Transaction*> transactionQueue;
 

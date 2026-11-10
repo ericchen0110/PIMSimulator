@@ -403,6 +403,8 @@ void MultiChannelMemorySystem::actual_update()
         csvOut->finalize();
     }
 
+    if (sparseEngine && sparseEngine->busy()) sparseEngine->update();
+
     for (size_t i = 0; i < configuration->NUM_CHANS; i++)
     {
         channels[i]->update();
@@ -581,9 +583,20 @@ int MultiChannelMemorySystem::hasPendingTransactions()
     int num = 0;
     for (auto chan : channels)
     {
-        num += chan->numOnTheFlyTransactions;
+        num += chan->numOnTheFlyTransactions + chan->pendingTransactions.size();
     }
-    return num;
+    return num + (sparseEngine && sparseEngine->busy());
+}
+
+void MultiChannelMemorySystem::submitSparsePIM(const SparsePIMJob& job, SparsePIMPolicy policy,
+                                              unsigned macLatency)
+{
+    if (hasPendingTransactions()) throw std::logic_error("Drain memory before submitting sparse PIM");
+    for (const auto* channel : channels)
+        for (const auto* rank : *channel->ranks)
+            if (rank->mode_ != dramMode::SB)
+                throw std::logic_error("Sparse PIM requires the legacy command engine to be in SB mode");
+    sparseEngine.reset(new SparsePIM(*this, job, policy, macLatency));
 }
 
 bool MultiChannelMemorySystem::willAcceptTransaction(uint64_t addr)

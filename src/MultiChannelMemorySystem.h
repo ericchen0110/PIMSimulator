@@ -31,6 +31,7 @@
 #ifndef __MULTI_CHANNEL_MEMORY_SYSTEM_H__H__
 #define __MULTI_CHANNEL_MEMORY_SYSTEM_H__H__
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,7 @@
 #include "MemoryObject.h"
 #include "MemorySystem.h"
 #include "SimulatorObject.h"
+#include "SparsePIM.h"
 #include "SystemConfiguration.h"
 #include "Transaction.h"
 
@@ -75,6 +77,9 @@ class MultiChannelMemorySystem : public MemoryObject
     void setCPUClockSpeed(uint64_t cpuClkFreqHz);
 
     int hasPendingTransactions();
+    void submitSparsePIM(const SparsePIMJob& job, SparsePIMPolicy policy,
+                         unsigned macLatency = 1);
+    const SparsePIM* sparsePIM() const { return sparseEngine.get(); }
 
     bool willAcceptTransaction(uint64_t addr);
     bool willAcceptTransaction();
@@ -106,6 +111,7 @@ class MultiChannelMemorySystem : public MemoryObject
     }
 
   private:
+    std::unique_ptr<SparsePIM> sparseEngine;
     unsigned findChannelNumber(uint64_t addr);
     void actual_update();
 

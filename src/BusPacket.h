@@ -31,6 +31,7 @@
 #ifndef BUSPACKET_H
 #define BUSPACKET_H
 
+#include <functional>
 #include <string>
 
 #include "Burst.h"
@@ -64,6 +65,7 @@ class BusPacket
     uint64_t physicalAddress;
     BurstType* data;
     std::string tag;
+    std::function<void()> onComplete;
 
     // Functions
     BusPacket(BusPacketType packtype, uint64_t physicalAddr, unsigned col, unsigned rw, unsigned r,

@@ -42,6 +42,14 @@ def build(target_name, base_path, build_flags):
     env.Append(CXXFLAGS=build_flags["CXXFLAGS"] + build_flags["gprof_option"])
     env.Append(LINKFLAGS=build_flags["LINKFLAGS"] + build_flags["gprof_option"])
 
+    # Optional local GoogleTest installation; default search paths are unchanged.
+    dependency_includes = [base_path["lib"], base_path["source"], base_path["tools"]]
+    dependency_libraries = ['.']
+    gtest_root = ARGUMENTS.get('GTEST_ROOT', '')
+    if gtest_root:
+        dependency_includes.append(joinpath(gtest_root, 'include'))
+        dependency_libraries.append(joinpath(gtest_root, 'lib'))
+
     # add flags
     env = getFlags(env)
 
@@ -50,8 +58,8 @@ def build(target_name, base_path, build_flags):
     build_sources = getSources("build")
     env.Program(target=target_name["binary"],
                 source=build_sources,
-                CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                LIBPATH=['.'], LIBS=['gtest', 'pthread'])
+                CPPPATH=dependency_includes,
+                LIBPATH=dependency_libraries, LIBS=['gtest', 'pthread'])
 
     no_lib = ARGUMENTS.get('NO_LIBRARY', 0)
     if int(no_lib) == 0:
@@ -59,14 +67,14 @@ def build(target_name, base_path, build_flags):
         # print ("Creating a static library from objects")
         env.StaticLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=dependency_includes,
+                          LIBPATH=dependency_libraries,
                           LIBS=['gtest', 'pthread'])
         # print ("Creating a shared library from objects")
         env.SharedLibrary(target=target_name["library"],
                           source=lib_sources,
-                          CPPPATH=[base_path["lib"], base_path["source"], base_path["tools"]],
-                          LIBPATH=['.'],
+                          CPPPATH=dependency_includes,
+                          LIBPATH=dependency_libraries,
                           LIBS=['gtest', 'pthread'])
 
 

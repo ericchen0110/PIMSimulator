@@ -1,0 +1,14 @@
+# Illustrative, UNCALIBRATED coefficients, not Samsung/HBM measurements.
+# Copy this file and fit every coefficient to your hardware/energy model.
+# Dynamic values are pJ/event. Static values are mW/rank or mW/block.
+name illustrative_uncalibrated_v1
+read_pj 100
+write_pj 120
+activate_pj 200
+precharge_pj 80
+refresh_pj 1000
+mac_pj 4
+instruction_pj 0.1
+rank_mw 1
+block_mw 0.01
+independent_control_mw 0.001

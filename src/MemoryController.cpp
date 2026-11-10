@@ -118,6 +118,7 @@ void MemoryController::receiveFromBus(BusPacket* bpacket)
     // add to return read data queue
     returnTransaction.push_back(
         new Transaction(RETURN_DATA, bpacket->physicalAddress, bpacket->data));
+    returnTransaction.back()->onComplete = bpacket->onComplete;
 
     // this delete statement saves a mindboggling amount of memory
     delete (bpacket);
@@ -130,6 +131,7 @@ void MemoryController::returnReadData(const Transaction* trans)
         (*parentMemorySystem->ReturnReadData)(parentMemorySystem->systemID, trans->address,
                                               currentClockCycle);
     parentMemorySystem->numOnTheFlyTransactions--;
+    if (trans->onComplete) trans->onComplete();
 }
 
 bool MemoryController::addBarrier()
@@ -173,6 +175,7 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
         writeDataToSend.push_back(new BusPacket(
             DATA, poppedBusPacket->physicalAddress, poppedBusPacket->column, poppedBusPacket->row,
             poppedBusPacket->rank, poppedBusPacket->bank, poppedBusPacket->data, dramsimLog));
+        writeDataToSend.back()->onComplete = poppedBusPacket->onComplete;
         writeDataCountdown.push_back(config.WL);
     }
 
@@ -182,6 +185,16 @@ void MemoryController::updateCommandQueue(BusPacket* poppedBusPacket)
     unsigned bank = poppedBusPacket->bank;
     auto am = config.addrMapping;
 
+    // Monotonic event counts for opt-in energy estimates; never reset at epochs.
+    switch (poppedBusPacket->busPacketType)
+    {
+        case READ: ++activity.reads; break;
+        case WRITE: ++activity.writes; break;
+        case ACTIVATE: ++activity.activates; break;
+        case PRECHARGE: ++activity.precharges; break;
+        case REF: case RFCSB: ++activity.refreshes; break;
+        default: break;
+    }
     switch (poppedBusPacket->busPacketType)
     {
         case READ:
@@ -348,6 +361,7 @@ void MemoryController::updateTransactionQueue()
                                     newTransactionRow, newTransactionRank, newTransactionBank,
                                     transaction->data, dramsimLog);
             command->tag = transaction->tag;
+            command->onComplete = transaction->onComplete;
             commandQueue.enqueue(command);
 
             // If we have a read, save the transaction so when the data comes back
@@ -484,8 +498,10 @@ void MemoryController::update()
                                                      currentClockCycle);
             }
             parentMemorySystem->numOnTheFlyTransactions--;
+            auto completed = outgoingDataPacket->onComplete;
             (*ranks)[outgoingDataPacket->rank]->receiveFromBus(outgoingDataPacket);
             outgoingDataPacket = NULL;
+            if (completed) completed();
         }
     }
 
@@ -548,7 +564,9 @@ void MemoryController::update()
         // find the pending read transaction to calculate latency
         for (size_t i = 0; i < pendingReadTransactions.size(); i++)
         {
-            if (pendingReadTransactions[i]->address == returnTransaction[0]->address)
+            if (pendingReadTransactions[i]->address == returnTransaction[0]->address &&
+                ((!pendingReadTransactions[i]->onComplete && !returnTransaction[0]->onComplete) ||
+                 pendingReadTransactions[i]->data == returnTransaction[0]->data))
             {
                 unsigned chan, rank, bank, row, col;
                 config.addrMapping.addressMapping(returnTransaction[0]->address, chan, rank, bank,
